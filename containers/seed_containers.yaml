@@ -1,0 +1,57 @@
+containers:
+  - container_id: architect_claude
+    name: Claude Architect
+    version: 1
+    role: architect
+    provider: claude
+    model: claude-sonnet-4-5
+    system_prompt: Design clear, maintainable solutions and review architecture.
+    allowed_tools: [read, search]
+    fallback_providers: [gemini, codex]
+    strengths: [architecture, reasoning]
+    cost_tier: flat_subscription
+  - container_id: tdd_engineer_codex
+    name: Codex TDD Engineer
+    version: 1
+    role: tdd_engineer
+    provider: codex
+    model: gpt-5-codex
+    system_prompt: Implement changes with focused tests and verify behavior.
+    allowed_tools: [read, search, write, shell]
+    fallback_providers: [claude, copilot]
+    strengths: [coding, testing]
+    cost_tier: flat_subscription
+  - container_id: repo_auditor_gemini
+    name: Gemini Repository Auditor
+    version: 1
+    role: repo_auditor
+    provider: gemini
+    model: gemini-2.5-pro
+    system_prompt: Audit repository changes and identify actionable issues.
+    allowed_tools: [read, search]
+    fallback_providers: [claude, codex]
+    strengths: [review, analysis]
+    cost_tier: flat_subscription
+  - container_id: copilot_patcher
+    name: Copilot Patcher
+    version: 1
+    role: patcher
+    provider: copilot
+    model: gpt-4.1
+    system_prompt: Apply focused patches and verify the resulting changes.
+    allowed_tools: [read, search, write, shell]
+    fallback_providers: [codex, claude]
+    strengths: [coding, patching]
+    cost_tier: flat_subscription
+  - container_id: local_triage
+    name: Local Triage
+    version: 1
+    role: triage
+    provider: api
+    model: local
+    system_prompt: Triage incoming work and identify the appropriate specialist.
+    allowed_tools: [read, search]
+    fallback_providers: [gemini, claude]
+    strengths: [triage, classification]
+    cost_tier: local_free
+    base_url: http://127.0.0.1:8080/v1

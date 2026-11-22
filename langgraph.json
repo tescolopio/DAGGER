@@ -1,0 +1,6 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "dagger": "./src/dagger/graph.py:graph"
+  }
+}
