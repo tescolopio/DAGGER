@@ -1,6 +1,7 @@
 """OpenAI-compatible HTTP execution."""
 
 import os
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -23,6 +24,17 @@ class OpenAICompatibleApiRunner(BaseProvider):
 
     async def run(self, container, task) -> str:
         base_url = container.base_url or "http://127.0.0.1:8080/v1"
+        try:
+            parsed_url = urlsplit(base_url)
+            if (
+                parsed_url.scheme not in ("http", "https")
+                or not parsed_url.hostname
+                or parsed_url.username is not None
+                or parsed_url.password is not None
+            ):
+                raise ValueError
+        except ValueError:
+            raise ProviderError("API base URL must be an HTTP(S) URL without embedded credentials") from None
         if not container.model:
             raise ProviderError("API model is not configured")
         headers = {}
