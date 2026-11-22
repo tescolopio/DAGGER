@@ -389,3 +389,19 @@ async def test_api_does_not_expose_httpx_error_details(monkeypatch, agent, task)
     rendered = "".join(traceback.format_exception(error.value))
     for secret in ("sensitive-value", "user", "password", "token=secret"):
         assert secret not in rendered
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        urlunsplit(("https", "user:password" + "@example.test", "/", "", "")),
+        "https://@example.test/v1",
+        "file:///etc/secret",
+        "http://[",
+    ],
+)
+async def test_api_rejects_invalid_or_credential_bearing_base_urls(agent, task, url):
+    agent.base_url = url
+    with pytest.raises(ProviderError, match="without embedded credentials") as error:
+        await OpenAICompatibleApiRunner().run(agent, task)
+    assert url not in str(error.value)
