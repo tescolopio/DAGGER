@@ -217,3 +217,40 @@ async def test_studio_executor_constructs_valid_envelope(monkeypatch):
     app = await module._studio()
     assert await app.manager.planner("plan") == "planned"
     assert seen[0].dod.acceptance_criteria == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_worker_handoff_renames_staging_to_outbox(monkeypatch, fails):
+    from pathlib import Path
+    from unittest.mock import AsyncMock, MagicMock
+
+    import dagger.agents.orchestrator as module
+    from dagger.schema import AgentContainer
+
+    app = module.Orchestrator.__new__(module.Orchestrator)
+    app.worktree = Path.cwd()
+    app.max_hops = 3
+    for name in ("inbox", "tmp", "outbox", "archive"):
+        bus = MagicMock()
+        bus._path.side_effect = lambda filename, directory=name: Path("bus") / directory / filename
+        setattr(app, name, bus)
+    app.select = AsyncMock(return_value=AgentContainer(name="worker", role="worker", provider="api"))
+    app._emit = AsyncMock()
+    app._update_milestone = AsyncMock()
+    app._run_provider = AsyncMock(side_effect=RuntimeError("failed") if fails else None,
+                                  return_value="result")
+    moves = []
+    monkeypatch.setattr(module.os, "replace", lambda source, target: moves.append((source, target)))
+    state = {"run_id": "run", "kanban_id": "board", "task": {
+        "milestone_id": "milestone", "title": "Task", "dod": {"acceptance_criteria": []},
+        "_hop_count": 0,
+    }}
+    if fails:
+        with pytest.raises(RuntimeError, match="failed"):
+            await app._work(state)
+    else:
+        assert await app._work(state) == "result"
+    name, payload = app.tmp.write.call_args.args
+    assert (Path("bus/tmp") / name, Path("bus/outbox") / name) in moves
+    assert payload["error" if fails else "result"] == ("failed" if fails else "result")

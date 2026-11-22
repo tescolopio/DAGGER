@@ -213,8 +213,8 @@ class ProjectManager:
             "Dependencies must reference other milestones and be acyclic. Give each "
             "acceptance criterion a corresponding executable verification command at "
             "the same array index; commands must exit zero only if the criterion is met. "
-            "Commands execute as shell checks in the worktree; artifact paths must "
-            "be worktree-relative. "
+            "Commands execute as shell checks in the worktree; any expected artifact "
+            "paths must be worktree-relative. Use an empty artifact list when none apply. "
             "Include concrete, independently checkable criteria and commands.\n"
             + json.dumps({"title": task.title, "description": task.description}, ensure_ascii=False)
         )
@@ -242,9 +242,8 @@ class ProjectManager:
             dependencies[milestone_id] = tuple(dep.strip() for dep in deps)
             milestone = MilestoneTask.model_validate(data)
             dod = milestone.dod
-            if (not dod.acceptance_criteria or not dod.expected_artifacts
-                    or len(dod.verification_commands) < len(dod.acceptance_criteria)):
-                raise ValueError("milestones require artifacts and a verification command for every criterion")
+            if not dod.acceptance_criteria or len(dod.verification_commands) < len(dod.acceptance_criteria):
+                raise ValueError("every acceptance criterion requires a verification command")
             for item in [*dod.acceptance_criteria, *dod.verification_commands, *dod.expected_artifacts]:
                 _text(item, "definition of done entry")
             milestones.append(milestone)
@@ -310,13 +309,10 @@ class ProjectManager:
             except (OSError, RuntimeError, ValueError):
                 exists = False
             artifacts.append(CheckEvidence(item, exists, "present" if exists else "missing or outside worktree"))
-        if not artifacts:
-            artifacts.append(CheckEvidence("(missing expected artifacts)", False, "No artifacts supplied"))
         unverifiable = (
             not milestone.dod.acceptance_criteria
             or any(not item.strip() for item in milestone.dod.acceptance_criteria)
             or len(commands) < len(milestone.dod.acceptance_criteria)
-            or not milestone.dod.expected_artifacts
             or any(result.returncode in (None, 126, 127) for result in commands[:len(criteria)])
         )
         passed = not unverifiable and all(result.passed for result in (*criteria, *artifacts, *commands))

@@ -112,6 +112,23 @@ async def test_unverifiable_criterion_requires_immediate_human_review():
 
 
 @pytest.mark.asyncio
+async def test_empty_artifacts_are_allowed_when_criterion_has_evidence():
+    async def planner(_):
+        return json.dumps({"milestones": [
+            {"milestone_id": ident, "title": ident, "depends_on": dependencies,
+             "dod": {"acceptance_criteria": ["README exists"],
+                     "verification_commands": ["test -f README.md"]}}
+            for ident, dependencies in (("one", []), ("two", ["one"]))
+        ]})
+
+    manager = ProjectManager(planner=planner, workspace=ROOT)
+    dag = await manager.decompose_goal(KanbanTask(title="goal"))
+    report = await manager.audit_milestone(dag.milestones[0], ROOT)
+    assert report.status == "DOD_PASSED"
+    assert report.artifact_results == ()
+
+
+@pytest.mark.asyncio
 async def test_empty_artifacts_and_missing_executable_fail_closed():
     manager = ProjectManager(workspace=ROOT)
     task = milestone(acceptance_criteria=["Something is checked"], expected_artifacts=[],
@@ -123,45 +140,39 @@ async def test_empty_artifacts_and_missing_executable_fail_closed():
 
 
 @pytest.mark.asyncio
-async def test_shell_operators_are_rejected_not_silently_ignored():
+async def test_shell_operators_are_executed_not_silently_ignored():
     manager = ProjectManager(workspace=ROOT)
     task = milestone(acceptance_criteria=["both commands succeed"], expected_artifacts=["README.md"],
-                     verification_commands=["test -f README.md && true"])
+                     verification_commands=["test -f README.md && false"])
     report = await manager.audit_milestone(task, ROOT)
     assert report.status == "DOD_FAILED"
-    assert report.command_results[0].returncode is None
-    assert report.human_review_required
+    assert report.command_results[0].returncode == 1
+    assert not report.human_review_required
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("check", [
-    "python -c 'print(1)'",
-    "test -f README.md; echo accepted",
-    "test -f /etc/passwd",
-    "grep --include=README.md DAGGER README.md",
-    "test -f README*",
-])
-async def test_unapproved_or_unsafe_checks_fail_closed(check):
+@pytest.mark.parametrize("check", ["test -f README.md && printf verified",
+                                   "printf verified | grep -q verified",
+                                   "test -f README*"])
+async def test_shell_checks_execute_in_worktree(check):
     task = milestone(acceptance_criteria=["checked"], expected_artifacts=["README.md"],
                      verification_commands=[check])
     report = await ProjectManager(workspace=ROOT).audit_milestone(task, ROOT)
-    assert report.status == "DOD_FAILED"
-    assert report.human_review_required
-    assert report.command_results[0].returncode is None
+    assert report.status == "DOD_PASSED"
+    assert report.command_results[0].returncode == 0
 
 
 @pytest.mark.asyncio
-async def test_low_level_verifier_also_rejects_shell_executables():
-    criterion = Criterion("do not run", ("/bin/sh", "-c", "true"))
+async def test_low_level_verifier_supports_executables():
+    criterion = Criterion("runs", ("/bin/sh", "-c", "true"))
     task = PlannedTask("id", "work", (criterion,))
     result = (await ProjectManager(workspace=ROOT).verify(task))[0]
-    assert not result.passed
-    assert result.returncode is None
-    assert "approved set" in result.stderr
+    assert result.passed
+    assert result.returncode == 0
 
 
 @pytest.mark.asyncio
-async def test_verifier_uses_minimal_environment(monkeypatch):
+async def test_verifier_strips_provider_credentials_but_preserves_path(monkeypatch):
     import asyncio
 
     original = asyncio.create_subprocess_exec
@@ -177,19 +188,54 @@ async def test_verifier_uses_minimal_environment(monkeypatch):
                      verification_commands=["test -f README.md"])
     report = await ProjectManager(workspace=ROOT).audit_milestone(task, ROOT)
     assert report.status == "DOD_PASSED"
-    assert captured[0][0][0] == "/usr/bin/test"
-    assert set(captured[0][1]) == {"PATH", "LANG"}
+    assert captured[0][0] == ("/bin/sh", "-c", "test -f README.md")
+    assert "ANTHROPIC_API_KEY" not in captured[0][1]
+    assert captured[0][1]["PATH"]
 
 
 @pytest.mark.asyncio
-async def test_rejects_artifacts_and_commands_outside_worktree():
+async def test_rejects_artifacts_outside_worktree():
     manager = ProjectManager(workspace=ROOT, command_timeout=0.1)
     task = milestone(acceptance_criteria=["Completes"], expected_artifacts=["../README.md"],
-                     verification_commands=["test -f ../README.md"])
+                     verification_commands=["test -f README.md"])
     report = await manager.audit_milestone(task, ROOT)
     assert report.status == "DOD_FAILED"
     assert not report.artifact_results[0].passed
-    assert "inside the worktree" in report.command_results[0].stderr
+    assert report.command_results[0].passed
+
+
+@pytest.mark.asyncio
+async def test_shell_check_timeout_is_recorded():
+    manager = ProjectManager(workspace=ROOT, command_timeout=0.1)
+    task = milestone(acceptance_criteria=["Completes"], expected_artifacts=["README.md"],
+                     verification_commands=["sleep 2"])
+    report = await manager.audit_milestone(task, ROOT)
+    assert report.status == "DOD_FAILED"
+    assert "timed out" in report.command_results[0].stderr
+
+
+@pytest.mark.asyncio
+async def test_uv_pytest_check_is_passed_to_shell(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            return b"pytest passed", b""
+
+    async def create_process(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    task = milestone(acceptance_criteria=["tests pass"], expected_artifacts=["README.md"],
+                     verification_commands=["uv run pytest -v"])
+    report = await ProjectManager(workspace=ROOT).audit_milestone(task, ROOT)
+    assert report.status == "DOD_PASSED"
+    assert calls[0][0] == ("/bin/sh", "-c", "uv run pytest -v")
 
 
 @pytest.mark.asyncio
