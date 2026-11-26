@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -280,20 +281,37 @@ def _parse_skill_file(skill_file: Path, root: Path, source: SkillSource) -> Load
     )
 
 
-def discover_skills(workspace_root: str | Path) -> list[LoadedSkill]:
-    """Discover and validate SKILL.md files in priority order, deduplicated by name."""
+def discover_skills(
+    workspace_root: str | Path, extra_roots: Iterable[str | Path] = ()
+) -> list[LoadedSkill]:
+    """Discover and validate SKILL.md files in priority order, deduplicated by name.
+
+    The workspace's own skills come first. `extra_roots` (e.g. the DAGGER install when it
+    works on another project) are searched afterwards, so a project skill wins a name clash.
+    Paths from extra roots are reported with a `dagger:` prefix.
+    """
     root = Path(workspace_root).resolve()
     if not root.is_dir():
         return []
 
-    search_roots: list[tuple[Path, str | None]] = [
-        (root / ".agent" / "skills", "dagger_local"),
-        (root / ".agents" / "skills", None),
-        (root / ".claude" / "skills", None),
+    bases: list[tuple[Path, str]] = [(root, "")]
+    for extra in extra_roots:
+        extra_path = Path(extra).resolve()
+        if extra_path.is_dir() and extra_path != root:
+            bases.append((extra_path, "dagger:"))
+
+    search_roots: list[tuple[Path, Path, str, str | None]] = [
+        (base, base / sub, prefix, fixed)
+        for base, prefix in bases
+        for sub, fixed in (
+            (Path(".agent") / "skills", "dagger_local"),
+            (Path(".agents") / "skills", None),
+            (Path(".claude") / "skills", None),
+        )
     ]
 
     by_name: dict[str, LoadedSkill] = {}
-    for skills_dir, fixed_source in search_roots:
+    for base, skills_dir, prefix, fixed_source in search_roots:
         if not skills_dir.is_dir():
             continue
         lock_names = (
@@ -308,7 +326,10 @@ def discover_skills(workspace_root: str | Path) -> list[LoadedSkill]:
                 if fixed_source is not None
                 else ("skillforge" if folder_name in lock_names else "workspace")
             )
-            loaded = _parse_skill_file(skill_file, root, source)
+            loaded = _parse_skill_file(skill_file, base, source)
+            if prefix:
+                loaded.path = prefix + loaded.path
+                loaded.locations = [prefix + loc for loc in loaded.locations]
             if fixed_source is None and loaded.name in lock_names:
                 loaded.source = "skillforge"
 
@@ -325,11 +346,12 @@ def discover_skills(workspace_root: str | Path) -> list[LoadedSkill]:
 class SkillRegistry:
     """Convenience wrapper around workspace skill discovery and matching."""
 
-    def __init__(self, workspace_root: str | Path) -> None:
+    def __init__(self, workspace_root: str | Path, extra_roots: Iterable[str | Path] = ()) -> None:
         self.workspace_root = Path(workspace_root).resolve()
+        self.extra_roots = list(extra_roots)
 
     def list_skills(self) -> list[LoadedSkill]:
-        return discover_skills(self.workspace_root)
+        return discover_skills(self.workspace_root, self.extra_roots)
 
     def match(
         self,

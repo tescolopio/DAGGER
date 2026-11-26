@@ -166,16 +166,31 @@ def test_api_skills_endpoint(tmp_path: Path, monkeypatch):
         encoding="utf-8",
     )
 
+    # A project skill with the same name as a bundled DAGGER skill must win.
+    _write_skill(
+        tmp_path / ".agents" / "skills",
+        "code-review",
+        "---\nname: code-review\ndescription: Project-specific review rules\n---\nBody",
+    )
+
+    # Pin the project: pytest's tmp dir sits inside the DAGGER repo, whose git root would win.
+    monkeypatch.setenv("DAGGER_PROJECT", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     app = create_app(db_path=tmp_path / "dagger.sqlite3", checkpoint_path=tmp_path / "cp.sqlite3")
     with TestClient(app) as client:
         resp = client.get("/api/skills")
         assert resp.status_code == 200
         payload = resp.json()
-        assert payload["count"] == 2
-        assert payload["sources"] == {"dagger_local": 1, "skillforge": 1}
-        names = {item["name"] for item in payload["skills"]}
-        assert names == {"dagger-local-one", "forged-one"}
+        by_name = {item["name"]: item for item in payload["skills"]}
+        # Project skills keep plain paths and come first.
+        assert by_name["dagger-local-one"]["source"] == "dagger_local"
+        assert by_name["forged-one"]["source"] == "skillforge"
+        assert by_name["code-review"]["description"] == "Project-specific review rules"
+        assert by_name["code-review"]["path"] == ".agents/skills/code-review/SKILL.md"
+        # DAGGER's own skills are bundled in when it works on another project.
+        assert by_name["dagger-invariant-guard"]["path"].startswith("dagger:")
+        assert by_name["using-code-scalpel"]["path"].startswith("dagger:")
+        assert payload["count"] == 3 + 13  # 3 project skills + 14 bundled, one shadowed
 
 
 def test_api_skills_real_repo_workspace(tmp_path: Path):

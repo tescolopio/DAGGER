@@ -7,21 +7,46 @@ atomic filesystem blackboard, and a live execution graph.
 ## Setup
 
 Install Python 3.11 or newer, [uv](https://docs.astral.sh/uv/), and Node.js.
-From the repository root:
+From the repository root, build the UI and install the `dagger` command:
 
 ```sh
-uv sync
-cd frontend
-npm install
-npm run build
-cd ..
-uv run dagger serve
+cd frontend && npm install && npm run build && cd ..
+uv tool install --editable .
 ```
 
-The API listens on `127.0.0.1:8420` by default. To run the frontend in
-development, start `npm run dev` in `frontend/` and open the URL printed by
-Vite. Use `uv run dagger serve --host <address> --port <port>` only when you
-intend to expose the server on another interface.
+The install is editable, so `dagger` always runs this checkout: pull or edit
+the code and the command picks it up (rebuild the UI after frontend changes).
+Remove it with `uv tool uninstall dagger-control-plane`.
+
+## Usage
+
+Run `dagger` inside the repository you want agents to work on, the same way
+you would start `claude` or `agy`:
+
+```sh
+cd ~/code/my-project
+dagger                 # start DAGGER for this repo and open the UI
+dagger run "goal"      # start a goal without the UI
+dagger info            # show the project and where its state lives
+dagger -C ../other     # work on another repo without changing directory
+```
+
+- **Project:** the git root of the current directory (or `-C <path>`).
+- **State:** the board, run history, checkpoints and file bus live in
+  `~/.dagger/projects/<repo>-<hash>/`, so the project tree stays clean.
+  Running inside this DAGGER checkout keeps using its own `data/`.
+- **Agents:** the catalog in `containers/` plus your own definitions in
+  `~/.dagger/containers/` (which wins on a clash, is hot-reloaded and is
+  where the generator exports). It is shared by all projects.
+- **Skills:** DAGGER's SkillForge and `dagger-*` skills are always available;
+  a project's own skills (`.agent/`, `.agents/`, `.claude/` `skills/`) are
+  added and win on a name clash.
+- **Server:** loopback only, on port 8420, or the next free port when
+  another project's DAGGER holds it. `--port`, `--host` and `--no-browser`
+  are available; `dagger serve` starts the server without opening a browser.
+
+Override locations with `DAGGER_HOME` (default `~/.dagger`),
+`DAGGER_DATA_DIR` (one project's state) and `DAGGER_CONTAINERS_DIR`.
 
 ## Providers
 
@@ -34,10 +59,10 @@ API containers can also target a cloud API.
 
 Optionally set `TAVILY_API_KEY` in the environment to enrich capability
 discovery with recent external information; without it discovery uses local
-probes and baseline heuristics. Run `uv run dagger refresh` to refresh the
+probes and baseline heuristics. Run `dagger refresh` to refresh the
 catalog immediately, or use the refresh button in the registry.
 
-Create a goal on the board or run `uv run dagger run "your goal"`. Milestones
+Create a goal on the board or run `dagger run "your goal"`. Milestones
 are audited against their definitions of done and require human approval before
 completion. Execution events can be inspected on the live graph.
 

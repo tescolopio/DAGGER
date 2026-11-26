@@ -34,8 +34,9 @@ def client(monkeypatch):
             self.stopped = True
 
     class Orchestrator:
-        def __init__(self, db, registry, manager, *, bus, checkpointer, bus_path):
+        def __init__(self, db, registry, manager, *, bus, checkpointer, bus_path, worktree_path, skill_roots):
             self.bus = bus
+            self.worktree_path = worktree_path
             self.calls = []
 
         async def start(self, run_id, goal, kanban_id=None):

@@ -18,11 +18,13 @@ import anyio
 import httpx
 import yaml
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from pydantic import BaseModel, ValidationError
 from watchfiles import awatch
 
+from dagger import paths
 from dagger.agents.generator import AgentGenerator
 from dagger.agents.orchestrator import Orchestrator
 from dagger.agents.project_manager import ProjectManager
@@ -90,10 +92,25 @@ def create_app(
     checkpoint_path: str | Path | None = None,
     *,
     generator_factory: Any = AgentGenerator,
-    container_dir: str | Path = "containers",
+    container_dir: str | Path | None = None,
+    project: str | Path | None = None,
 ) -> FastAPI:
-    """Create an app, optionally overriding storage paths for an isolated instance."""
-    data_path = Path(os.environ.get("DAGGER_DATA_DIR", "data"))
+    """Create an app, optionally overriding storage paths for an isolated instance.
+
+    The project (the repository agents work on) defaults to DAGGER_PROJECT or the git root
+    of the current directory; its state lives outside the project (see dagger.paths).
+    """
+    project_root = paths.resolve_project(project)
+    data_path = paths.project_state_dir(project_root)
+    if container_dir is not None:
+        writable_definitions = Path(container_dir)
+        bundled_definitions: Path | None = None
+    else:
+        writable_definitions = paths.writable_containers_dir(project_root)
+        bundled_definitions = paths.bundled_containers_dir()
+        if bundled_definitions.resolve() == writable_definitions.resolve():
+            bundled_definitions = None
+    skill_roots = paths.bundled_skill_roots(project_root)
     database_path = Path(db_path) if db_path is not None else data_path / "dagger.sqlite3"
     if db_path is not None:
         data_path = database_path.parent
@@ -153,14 +170,14 @@ def create_app(
                     )
                     return result if isinstance(result, str) else str(result)
 
-                manager = ProjectManager(planner=execute, worker=execute)
+                manager = ProjectManager(planner=execute, worker=execute, workspace=project_root)
                 bus_path = data_path / "bus"
                 orchestrator = Orchestrator(
                     db, registry, manager, bus=bus, checkpointer=checkpointer,
-                    bus_path=bus_path,
+                    bus_path=bus_path, worktree_path=project_root, skill_roots=skill_roots,
                 )
                 bus_path.mkdir(parents=True, exist_ok=True)
-                definitions_path = Path(container_dir)
+                definitions_path = writable_definitions
                 definitions_path.mkdir(parents=True, exist_ok=True)
 
                 async def load_definition(path: Path, *, initial: bool = False) -> None:
@@ -181,8 +198,11 @@ def create_app(
                     except (OSError, ValueError, yaml.YAMLError, ValidationError):
                         logger.exception("Could not reload container definitions from %s", path)
 
-                for path in definitions_path.iterdir():
-                    await load_definition(path, initial=True)
+                # The writable catalog loads first so a user's definition wins over the bundled one.
+                for directory in (definitions_path, bundled_definitions):
+                    if directory is not None and directory.is_dir():
+                        for path in sorted(directory.iterdir()):
+                            await load_definition(path, initial=True)
 
                 generator = generator_factory(
                     db, job_store_path=data_path / "scheduler.sqlite3",
@@ -191,6 +211,9 @@ def create_app(
                 await generator.refresh_catalog()
                 generator.start()
                 app.state.db = db
+                app.state.workspace_root = project_root
+                app.state.skill_roots = skill_roots
+                app.state.data_path = data_path
                 app.state.bus = bus
                 app.state.orchestrator = orchestrator
                 app.state.generator = generator
@@ -623,7 +646,7 @@ def create_app(
         from .skills import discover_skills
 
         workspace_root = getattr(app.state, "workspace_root", Path.cwd())
-        skills = discover_skills(workspace_root)
+        skills = discover_skills(workspace_root, getattr(app.state, "skill_roots", ()))
         counts_by_source: dict[str, int] = {}
         for skill in skills:
             counts_by_source[skill.source] = counts_by_source.get(skill.source, 0) + 1
@@ -832,6 +855,19 @@ def create_app(
         finally:
             with anyio.CancelScope(shield=True):
                 await app.state.bus.unsubscribe(queue)
+
+    @app.get("/api/project")
+    async def project_info():
+        return {
+            "project": str(getattr(app.state, "workspace_root", project_root)),
+            "state_dir": str(getattr(app.state, "data_path", data_path)),
+        }
+
+    # Serve the built UI from the same origin, so `dagger` needs no separate frontend server.
+    # Mounted last: the API and WebSocket routes above take precedence.
+    dist = paths.frontend_dist_dir()
+    if (dist / "index.html").is_file():
+        app.mount("/", StaticFiles(directory=dist, html=True), name="ui")
 
     return app
 

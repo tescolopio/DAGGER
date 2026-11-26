@@ -8,6 +8,7 @@ import os
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -37,6 +38,7 @@ class Orchestrator:
         self, db, registry, project_manager, bus: EventBus | None = None,
         checkpointer=None, max_remediations: int = 2, *, max_hops: int | None = None,
         worktree_path: str | Path = ".", bus_path: str | Path = ".dagger/bus",
+        skill_roots: Iterable[str | Path] = (),
     ) -> None:
         self.db = db
         self.registry = registry
@@ -46,6 +48,7 @@ class Orchestrator:
         if self.max_hops < 0:
             raise ValueError("max_hops must be non-negative")
         self.worktree = Path(worktree_path).resolve()
+        self.skill_roots: list[Path] = [Path(root) for root in skill_roots]
         self.inbox = FileBus(Path(bus_path) / "inbox")
         self.tmp = FileBus(Path(bus_path) / "tmp")
         self.outbox = FileBus(Path(bus_path) / "outbox")
@@ -207,7 +210,7 @@ class Orchestrator:
         rolodex_text = AgentGenerator.generate_rolodex_text(entries, active_only=True)
         from ..skills import discover_skills, format_skills_for_planner
 
-        skills_text = format_skills_for_planner(discover_skills(self.worktree))
+        skills_text = format_skills_for_planner(discover_skills(self.worktree, getattr(self, "skill_roots", ())))
         effective_run_id = state.get("run_id") or task.run_id or ""
         pm_provider = getattr(self.project_manager, "provider", "system") or "system"
         await self._emit_card_log(
@@ -467,7 +470,7 @@ class Orchestrator:
         from ..skills import SkillRegistry, format_matched_skills_for_prompt
 
         read_only = self._is_read_only_container(container)
-        skill_registry = SkillRegistry(self.worktree)
+        skill_registry = SkillRegistry(self.worktree, getattr(self, "skill_roots", ()))
         matched_skills = skill_registry.match(
             required_skills=list(milestone.required_skills),
             context_text=f"{milestone.title} {milestone.description}",
