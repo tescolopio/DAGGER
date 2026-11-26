@@ -1,0 +1,27 @@
+container_id: agy_swarm_squad
+name: Agy Swarm Squad
+version: 2
+role: swarm_squad
+provider: agy
+model: claude-haiku-4-5
+system_prompt: ''
+allowed_tools:
+- read
+- search
+- write
+- edit
+fallback_providers:
+- architect_claude
+- tdd_engineer_codex
+strengths:
+- swarm
+- fullstack
+- architecture
+- coding
+- testing
+cost_tier: flat_subscription
+max_concurrency: 2
+base_url: null
+api_key_env: null
+active: false
+use_token_auth: false

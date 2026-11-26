@@ -10,6 +10,7 @@ from dagger.agents.project_manager import (
     PlannedTask,
     ProjectManager,
     VerificationResult,
+    guard_verification_command,
 )
 from dagger.schema import DefinitionOfDone, KanbanTask, MilestoneTask
 
@@ -312,3 +313,193 @@ async def test_real_pm_plan_and_audit_integrate_with_graph():
     assert seen == ["first", "second"]
     assert all(report["status"] == "DOD_PASSED" for report in state.values["audits"].values())
     assert state.next == ("human_review_gate",)
+
+
+@pytest.mark.asyncio
+async def test_decompose_populates_allowed_write_paths_and_guards_shell_commands(tmp_path):
+    captured_prompts = []
+
+    async def planner(prompt):
+        captured_prompts.append(prompt)
+        return json.dumps({
+            "milestones": [
+                {
+                    "milestone_id": "audit",
+                    "title": "Audit codebase",
+                    "depends_on": [],
+                    "dod": {
+                        "acceptance_criteria": [
+                            "Audit report has at least 2 lines",
+                            "Audit report mentions FINDINGS",
+                        ],
+                        "expected_artifacts": ["docs/audit.md"],
+                        "verification_commands": [
+                            'test "$(awk \'END{print NR}\' docs/audit.md)" -ge 2',
+                            "grep -q FINDINGS docs/audit.md",
+                        ],
+                    },
+                },
+                {
+                    "milestone_id": "summary",
+                    "title": "Write summary",
+                    "depends_on": ["audit"],
+                    "dod": {
+                        "acceptance_criteria": ["Summary has at least 1 line"],
+                        "expected_artifacts": ["docs/summary.md"],
+                        "verification_commands": [
+                            "test $(awk 'END{print NR}' docs/summary.md) -ge 1",
+                        ],
+                    },
+                },
+            ]
+        })
+
+    pm = ProjectManager(planner=planner, workspace=tmp_path)
+    dag = await pm.decompose_goal(KanbanTask(title="Audit repo", description="Produce reports"))
+
+    assert "test -s <path> &&" in captured_prompts[0]
+    assert 'test "$(awk ...)" -ge N' in captured_prompts[0]
+
+    audit_m, summary_m = dag.milestones
+    assert audit_m.allowed_write_paths == ["docs/audit.md"]
+    assert summary_m.allowed_write_paths == ["docs/summary.md"]
+
+    for cmd in audit_m.dod.verification_commands:
+        assert cmd.startswith("test -s docs/audit.md && ")
+        assert 'test "$(awk' not in cmd
+        assert "test $(awk" not in cmd
+
+    summary_cmd = summary_m.dod.verification_commands[0]
+    assert summary_cmd.startswith("test -s docs/summary.md && ")
+    assert "test $(awk" not in summary_cmd
+
+    # Missing file fails cleanly with exit 1 and no `/bin/sh: test: Illegal number:`.
+    missing_report = await pm.audit_milestone(audit_m, tmp_path)
+    assert missing_report.status == "DOD_FAILED"
+    assert all(res.returncode == 1 for res in missing_report.command_results)
+    assert all("Illegal number" not in res.stderr for res in missing_report.command_results)
+
+    # Empty file (0 bytes) is rejected by `test -s` without shell numeric errors.
+    report_path = tmp_path / "docs" / "audit.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("", encoding="utf-8")
+    empty_report = await pm.audit_milestone(audit_m, tmp_path)
+    assert empty_report.status == "DOD_FAILED"
+    assert all("Illegal number" not in res.stderr for res in empty_report.command_results)
+
+    # Populated file satisfies both guarded checks.
+    report_path.write_text("# Audit\nFINDINGS: clean\n", encoding="utf-8")
+    passed_report = await pm.audit_milestone(audit_m, tmp_path)
+    assert passed_report.status == "DOD_PASSED"
+    assert all(res.passed for res in passed_report.command_results)
+
+
+@pytest.mark.asyncio
+async def test_guard_verification_command_prevents_illegal_number_on_empty_awk_output(tmp_path):
+    raw_cmd = 'test "$(awk \'/MATCH/ {c++} END {if (c) print c}\' report.md)" -ge 1'
+    guarded = guard_verification_command(raw_cmd, ["report.md"])
+    assert guarded.startswith("test -s report.md && ")
+    assert 'test "$(awk' not in guarded
+
+    (tmp_path / "report.md").write_text("no hit here\n", encoding="utf-8")
+    pm = ProjectManager(workspace=tmp_path)
+    task = milestone(
+        acceptance_criteria=["At least 1 match"],
+        expected_artifacts=["report.md"],
+        verification_commands=[raw_cmd],
+    )
+    failed = await pm.audit_milestone(task, tmp_path)
+    assert failed.status == "DOD_FAILED"
+    assert failed.command_results[0].returncode == 1
+    assert "Illegal number" not in failed.command_results[0].stderr
+
+    (tmp_path / "report.md").write_text("MATCH line\n", encoding="utf-8")
+    passed = await pm.audit_milestone(task, tmp_path)
+    assert passed.status == "DOD_PASSED"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_consecutive_dod_failures_short_circuit_without_third_hop(tmp_path):
+    from dagger.graph import build_graph
+
+    async def planner(_):
+        return json.dumps({
+            "milestones": [
+                {
+                    "milestone_id": "first",
+                    "title": "First",
+                    "depends_on": [],
+                    "dod": {
+                        "acceptance_criteria": ["Output file exists"],
+                        "expected_artifacts": ["output.md"],
+                        "verification_commands": ["test -s output.md"],
+                    },
+                },
+                {
+                    "milestone_id": "second",
+                    "title": "Second",
+                    "depends_on": ["first"],
+                    "dod": {
+                        "acceptance_criteria": ["Second file exists"],
+                        "expected_artifacts": ["second.md"],
+                        "verification_commands": ["test -s second.md"],
+                    },
+                },
+            ]
+        })
+
+    pm = ProjectManager(planner=planner, workspace=tmp_path, max_hops=3)
+    worker_calls = []
+
+    async def graph_plan(state):
+        dag = await pm.decompose_goal(KanbanTask(title=state["goal"]))
+        return {
+            "milestones": [task.model_dump(mode="json") for task in dag.milestones],
+            "dependencies": {key: list(value) for key, value in dag.dependencies.items()},
+        }
+
+    async def graph_worker(state):
+        worker_calls.append((state["task"]["milestone_id"], state["task"]["_hop_count"]))
+        return "unchanged"
+
+    async def graph_audit(task, hop):
+        model = MilestoneTask.model_validate({k: v for k, v in task.items() if not k.startswith("_")})
+        return asdict(await pm.audit_milestone(model, tmp_path, hop + 1, 3, run_id=task.get("_run_id")))
+
+    graph = build_graph(graph_plan, graph_worker, graph_audit, max_hops=3)
+    config = {"configurable": {"thread_id": "dup-short-circuit"}}
+    await graph.ainvoke({"run_id": "r-dup", "kanban_id": "k-dup", "goal": "Short circuit"}, config)
+    state = await graph.aget_state(config)
+
+    # Hop 1 and Hop 2 fail identically -> escalates immediately without burning hop 3.
+    assert worker_calls == [("first", 0), ("first", 1)]
+    assert state.values["attempts"]["first"] == 2
+    first_audit = state.values["audits"]["first"]
+    assert first_audit["status"] == "DOD_FAILED"
+    assert first_audit["human_review_required"] is True
+    assert "Duplicate failure signature" in first_audit["remediation_brief"]
+    assert state.next == ("human_review_gate",)
+
+
+@pytest.mark.asyncio
+async def test_standalone_run_duplicate_failure_short_circuits_before_third_hop(tmp_path):
+    worker_calls = []
+
+    async def planner(_):
+        return json.dumps({
+            "tasks": [{
+                "id": "task-1",
+                "description": "produce artifact",
+                "definition_of_done": [{"description": "artifact exists", "command": ["test", "-s", "missing.txt"]}],
+            }]
+        })
+
+    async def worker(prompt):
+        worker_calls.append(prompt)
+        return "no progress"
+
+    pm = ProjectManager(planner=planner, worker=worker, workspace=tmp_path, max_hops=3)
+    report = await pm.run("goal")
+    assert report.status == "human_review_required"
+    assert report.hops == 2
+    assert len(worker_calls) == 2

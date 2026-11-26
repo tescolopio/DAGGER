@@ -6,12 +6,12 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-ProviderType = Literal["claude", "codex", "gemini", "copilot", "api"]
+ProviderType = Literal["claude", "codex", "gemini", "copilot", "agy", "api"]
 Provider = ProviderType
 CostTier = Literal["flat_subscription", "local_free", "metered_api"]
 GraphEventType = Literal[
     "NODE_SPAWNED", "EDGE_TRAVERSED", "DOD_PASSED", "DOD_FAILED",
-    "HUMAN_GATE", "COMPLETED", "FAILED", "FALLBACK",
+    "HUMAN_GATE", "COMPLETED", "FAILED", "FALLBACK", "SWARM_POST",
 ]
 KanbanStatus = Literal["Backlog", "Planning", "Running", "DoD Audit", "Review", "Done", "Failed"]
 
@@ -39,7 +39,7 @@ class AgentContainer(StrictModel):
     model: str | None = None
     system_prompt: str = ""
     allowed_tools: list[str] = Field(default_factory=list)
-    fallback_providers: list[Provider] = Field(default_factory=list)
+    fallback_providers: list[str] = Field(default_factory=list)
     strengths: list[str] = Field(default_factory=list)
     cost_tier: CostTier = "flat_subscription"
     max_concurrency: int = Field(default=2, ge=1)
@@ -76,12 +76,25 @@ class DefinitionOfDone(StrictModel):
     verification_commands: list[str] = Field(default_factory=list)
 
 
+class SkillSummary(StrictModel):
+    name: str = Field(min_length=1)
+    description: str = ""
+    source: Literal["dagger_local", "skillforge", "workspace"]
+    path: str = Field(min_length=1)
+    locations: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    allowed_tools: list[str] = Field(default_factory=list)
+    valid: bool = True
+    validation_errors: list[str] = Field(default_factory=list)
+
+
 class MilestoneTask(StrictModel):
     milestone_id: str = Field(default_factory=_id, min_length=1)
     title: str = Field(min_length=1)
     description: str = ""
     required_skills: list[str] = Field(default_factory=list)
     dod: DefinitionOfDone
+    allowed_write_paths: list[str] = Field(default_factory=list)
     assigned_container_id: str | None = None
     status: str = "pending"
     output_summary: str | None = None
@@ -112,6 +125,8 @@ class TaskEnvelope(StrictModel):
     prompt: str = Field(min_length=1)
     dod: DefinitionOfDone
     worktree_path: str | None = None
+    allowed_write_paths: list[str] = Field(default_factory=list)
+    allowed_mcp_tools: list[str] = Field(default_factory=list)
     hop_count: int = Field(default=0, ge=0)
     max_hops: int = Field(default=3, ge=0)
 
@@ -133,3 +148,50 @@ class GraphEvent(StrictModel):
     @classmethod
     def parse_timestamp(cls, value: Any) -> Any:
         return datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
+
+
+class UsageEvent(StrictModel):
+    event_id: str = Field(default_factory=_id, min_length=1)
+    timestamp: datetime = Field(default_factory=_now)
+    run_id: str | None = None
+    kanban_id: str | None = None
+    container_id: str | None = None
+    provider: str = Field(min_length=1)
+    model: str | None = None
+    cost_tier: CostTier = "flat_subscription"
+    duration_ms: int = Field(default=0, ge=0)
+    input_tokens_est: int = Field(default=0, ge=0)
+    output_tokens_est: int = Field(default=0, ge=0)
+    estimated_cost_usd: float = Field(default=0.0, ge=0.0)
+    success: bool = True
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def parse_timestamp(cls, value: Any) -> Any:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
+
+
+class ProviderCredentialStatus(StrictModel):
+    provider_id: str = Field(min_length=1)
+    display_name: str = Field(min_length=1)
+    kind: Literal["subscription_cli", "api_key", "local"]
+    status: Literal["authenticated", "expired", "missing_binary", "api_key_configured", "unconfigured"]
+    detail: str = ""
+    supports_login: bool = False
+    supports_api_key: bool = False
+
+
+CardLogChannel = Literal["dialogue", "stdout", "stderr", "command", "system"]
+
+
+class CardLogEntry(StrictModel):
+    event_type: Literal["CARD_LOG"] = "CARD_LOG"
+    log_id: str = Field(default_factory=_id, min_length=1)
+    kanban_id: str = Field(min_length=1)
+    run_id: str = ""
+    milestone_id: str | None = None
+    node_id: str = Field(min_length=1)
+    provider: str = Field(min_length=1)
+    channel: CardLogChannel
+    text: str = ""
+    ts: str = Field(default_factory=lambda: _now().isoformat())

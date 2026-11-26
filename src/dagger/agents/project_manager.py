@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import shlex
 import signal
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +24,626 @@ SECRETS_ENV_VARS = frozenset({
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
     "GITHUB_TOKEN", "GH_TOKEN", "TAVILY_API_KEY",
 })
+
+_NUMERIC_TEST_OPS: dict[str, str] = {
+    "-eq": "==",
+    "-ne": "!=",
+    "-gt": ">",
+    "-ge": ">=",
+    "-lt": "<",
+    "-le": "<=",
+}
+
+_FILE_CONTENT_WITH_SCRIPT = frozenset({"awk", "gawk", "mawk", "nawk", "sed", "jq", "yq"})
+_FILE_CONTENT_WITH_PATTERN = frozenset({"grep", "egrep", "fgrep", "rg"})
+_FILE_CONTENT_DIRECT = frozenset({
+    "cat", "wc", "head", "tail", "cut", "sort", "uniq", "diff", "cmp",
+    "nl", "od", "hexdump", "strings", "file",
+})
+_SCRIPT_INTERPRETERS = frozenset({"python", "python3", "node", "perl", "ruby"})
+
+_OPTS_WITH_ARG: dict[str, frozenset[str]] = {
+    "awk": frozenset({"-F", "-v", "-f", "-i", "-l", "-E", "-W"}),
+    "gawk": frozenset({"-F", "-v", "-f", "-i", "-l", "-E", "-W"}),
+    "mawk": frozenset({"-F", "-v", "-f", "-i", "-l", "-E", "-W"}),
+    "nawk": frozenset({"-F", "-v", "-f", "-i", "-l", "-E", "-W"}),
+    "sed": frozenset({"-e", "-f"}),
+    "jq": frozenset({"-f", "--from-file", "--arg", "--argjson", "--slurpfile", "--rawfile", "--argfile", "-L"}),
+    "yq": frozenset({"-f", "--from-file", "--arg", "--argjson", "--slurpfile", "--rawfile", "--argfile", "-L"}),
+    "grep": frozenset({
+        "-e", "-f", "-m", "-A", "-B", "-C", "-D", "-d",
+        "--regexp", "--file", "--max-count", "--after-context", "--before-context",
+        "--context", "--label", "--exclude", "--include", "--exclude-dir", "--include-dir",
+    }),
+    "egrep": frozenset({
+        "-e", "-f", "-m", "-A", "-B", "-C", "-D", "-d",
+        "--regexp", "--file", "--max-count", "--after-context", "--before-context",
+        "--context", "--label", "--exclude", "--include", "--exclude-dir", "--include-dir",
+    }),
+    "fgrep": frozenset({
+        "-e", "-f", "-m", "-A", "-B", "-C", "-D", "-d",
+        "--regexp", "--file", "--max-count", "--after-context", "--before-context",
+        "--context", "--label", "--exclude", "--include", "--exclude-dir", "--include-dir",
+    }),
+    "rg": frozenset({
+        "-e", "-f", "-m", "-A", "-B", "-C", "-g", "-t", "-T",
+        "--regexp", "--file", "--max-count", "--after-context", "--before-context",
+        "--context", "--glob", "--type", "--type-not",
+    }),
+    "head": frozenset({"-n", "-c", "--lines", "--bytes"}),
+    "tail": frozenset({"-n", "-c", "--lines", "--bytes"}),
+    "wc": frozenset({"--files0-from"}),
+    "cut": frozenset({"-b", "-c", "-d", "-f", "--bytes", "--characters", "--delimiter", "--fields", "--output-delimiter"}),
+    "sort": frozenset({"-k", "-t", "-o", "-T", "-S", "--key", "--field-separator", "--output", "--temporary-directory", "--buffer-size"}),
+    "uniq": frozenset({"-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"}),
+    "diff": frozenset({"-U", "-C", "-I", "-x", "-X", "-L", "--unified", "--context", "--label"}),
+    "cmp": frozenset({"-i", "-n", "--ignore-initial", "--bytes"}),
+}
+
+_SCRIPT_PROVIDING_FLAGS: dict[str, frozenset[str]] = {
+    "awk": frozenset({"-f", "-E"}),
+    "gawk": frozenset({"-f", "-E"}),
+    "mawk": frozenset({"-f", "-E"}),
+    "nawk": frozenset({"-f", "-E"}),
+    "sed": frozenset({"-e", "-f"}),
+    "jq": frozenset({"-f", "--from-file"}),
+    "yq": frozenset({"-f", "--from-file"}),
+    "grep": frozenset({"-e", "-f", "--regexp", "--file"}),
+    "egrep": frozenset({"-e", "-f", "--regexp", "--file"}),
+    "fgrep": frozenset({"-e", "-f", "--regexp", "--file"}),
+    "rg": frozenset({"-e", "-f", "--regexp", "--file"}),
+}
+
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_INT_TOKEN_RE = re.compile(r"""^(?:"(-?\d+)"|'(-?\d+)'|(-?\d+))(?=$|[\s;&|)\]])""")
+
+
+def _scan_cmd_subst(text: str, start: int) -> tuple[str, int] | None:
+    """Scan a POSIX $(...) or `...` command substitution starting at `start`."""
+    n = len(text)
+    if text[start:start + 2] == "$(":
+        i = start + 2
+        depth = 1
+        in_single = False
+        in_double = False
+        escaped = False
+        while i < n:
+            ch = text[i]
+            if escaped:
+                escaped = False
+                i += 1
+                continue
+            if in_single:
+                if ch == "'":
+                    in_single = False
+                i += 1
+                continue
+            if ch == "\\":
+                escaped = True
+                i += 1
+                continue
+            if in_double:
+                if ch == '"':
+                    in_double = False
+                i += 1
+                continue
+            if ch == "'":
+                in_single = True
+            elif ch == '"':
+                in_double = True
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[start + 2:i], i + 1
+            i += 1
+        return None
+    if start < n and text[start] == "`":
+        i = start + 1
+        escaped = False
+        while i < n:
+            ch = text[i]
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == "`":
+                return text[start + 1:i], i + 1
+            i += 1
+    return None
+
+
+def _scan_quoted_or_unquoted_subst(text: str, pos: int) -> tuple[str, int] | None:
+    """Scan `$(...)`, `"$(...)"`, `` `...` ``, or `` "`...`" `` at `pos`."""
+    if pos >= len(text):
+        return None
+    if text[pos] == '"':
+        res = _scan_cmd_subst(text, pos + 1)
+        if res is None:
+            return None
+        inner, end = res
+        if end < len(text) and text[end] == '"':
+            return inner, end + 1
+        return None
+    return _scan_cmd_subst(text, pos)
+
+
+def _skip_ws(text: str, pos: int) -> int:
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    return pos
+
+
+def _match_numeric_test(text: str, start: int) -> tuple[str, int] | None:
+    """Match `test <subst> -op <num>` / `[ <subst> -op <num> ]` (or reversed) at `start`."""
+    n = len(text)
+    if text.startswith("test", start) and start + 4 < n and text[start + 4].isspace():
+        is_bracket = False
+        pos = _skip_ws(text, start + 4)
+    elif text[start] == "[" and start + 1 < n and text[start + 1].isspace():
+        is_bracket = True
+        pos = _skip_ws(text, start + 1)
+    else:
+        return None
+
+    def _finish(end_pos: int) -> int | None:
+        if is_bracket:
+            ws_pos = _skip_ws(text, end_pos)
+            if ws_pos == end_pos or ws_pos >= n or text[ws_pos] != "]":
+                return None
+            end_pos = ws_pos + 1
+        if end_pos < n and not (text[end_pos].isspace() or text[end_pos] in ";&|)"):
+            return None
+        return end_pos
+
+    # Form 1: <subst> <op> <num>
+    subst = _scan_quoted_or_unquoted_subst(text, pos)
+    if subst is not None:
+        inner, after_subst = subst
+        op_pos = _skip_ws(text, after_subst)
+        if op_pos > after_subst:
+            op = text[op_pos:op_pos + 3]
+            if op in _NUMERIC_TEST_OPS and op_pos + 3 < n and text[op_pos + 3].isspace():
+                num_pos = _skip_ws(text, op_pos + 3)
+                m = _INT_TOKEN_RE.match(text[num_pos:])
+                if m is not None and inner.strip():
+                    num = m.group(1) or m.group(2) or m.group(3)
+                    end_pos = _finish(num_pos + m.end())
+                    if end_pos is not None:
+                        awk_op = _NUMERIC_TEST_OPS[op]
+                        safe = (
+                            f"({{ {inner.strip()}; }} | "
+                            f"awk 'NR==1 && $1 ~ /^-?[0-9]+$/ {{v=$1+0; ok=1}} "
+                            f"END {{exit !(ok && (v {awk_op} {num}))}}')"
+                        )
+                        return safe, end_pos
+
+    # Form 2: <num> <op> <subst>
+    m = _INT_TOKEN_RE.match(text[pos:])
+    if m is not None:
+        num = m.group(1) or m.group(2) or m.group(3)
+        after_num = pos + m.end()
+        op_pos = _skip_ws(text, after_num)
+        if op_pos > after_num:
+            op = text[op_pos:op_pos + 3]
+            if op in _NUMERIC_TEST_OPS and op_pos + 3 < n and text[op_pos + 3].isspace():
+                subst_pos = _skip_ws(text, op_pos + 3)
+                subst = _scan_quoted_or_unquoted_subst(text, subst_pos)
+                if subst is not None:
+                    inner, after_subst = subst
+                    if inner.strip():
+                        end_pos = _finish(after_subst)
+                        if end_pos is not None:
+                            awk_op = _NUMERIC_TEST_OPS[op]
+                            safe = (
+                                f"({{ {inner.strip()}; }} | "
+                                f"awk 'NR==1 && $1 ~ /^-?[0-9]+$/ {{v=$1+0; ok=1}} "
+                                f"END {{exit !(ok && ({num} {awk_op} v))}}')"
+                            )
+                            return safe, end_pos
+    return None
+
+
+def _rewrite_numeric_test_substitutions(command: str) -> str:
+    """Replace fragile `test "$(...)" -ge N` checks with safe POSIX awk comparisons."""
+    out: list[str] = []
+    i = 0
+    n = len(command)
+    in_single = False
+    in_double = False
+    escaped = False
+    at_cmd_start = True
+
+    while i < n:
+        ch = command[i]
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if in_single:
+            out.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if in_double:
+            out.append(ch)
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+
+        if at_cmd_start and ch in ("t", "["):
+            matched = _match_numeric_test(command, i)
+            if matched is not None:
+                replacement, end_pos = matched
+                out.append(replacement)
+                i = end_pos
+                at_cmd_start = False
+                continue
+
+        if ch == "'":
+            in_single = True
+            at_cmd_start = False
+            out.append(ch)
+            i += 1
+        elif ch == '"':
+            in_double = True
+            at_cmd_start = False
+            out.append(ch)
+            i += 1
+        elif ch.isspace():
+            out.append(ch)
+            i += 1
+        elif ch in ";|&({!":
+            out.append(ch)
+            at_cmd_start = True
+            i += 1
+        else:
+            out.append(ch)
+            at_cmd_start = False
+            i += 1
+    return "".join(out)
+
+
+def _is_guardable_path(token: str, expected_artifacts: frozenset[str]) -> bool:
+    if not token or token in {"-", ".", ".."} or token.startswith("-") or token.startswith("/dev/"):
+        return False
+    if token.endswith("/"):
+        return False
+    if token in expected_artifacts:
+        return True
+    if any(ch in token for ch in "$*?[]`~"):
+        return False
+    return True
+
+
+def _tokenize_shell(command: str) -> list[str] | None:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";|&<>()")
+        lexer.whitespace_split = False
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _extract_file_content_paths(command: str, expected_artifacts: Sequence[str]) -> list[str]:
+    """Identify file paths inspected by file-content commands in `command`."""
+    expected_set = frozenset(item.strip() for item in expected_artifacts if isinstance(item, str) and item.strip())
+    tokens = _tokenize_shell(command)
+    if tokens is None:
+        return [
+            artifact for artifact in expected_artifacts
+            if isinstance(artifact, str) and artifact.strip() and artifact.strip() in command
+        ]
+
+    # Split token stream into simple commands.
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for tok in tokens:
+        if tok in {"&&", "||", ";", "|", "(", ")", "{", "}"}:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(tok)
+    if current:
+        segments.append(current)
+
+    found: list[str] = []
+
+    def _add(path: str) -> None:
+        if _is_guardable_path(path, expected_set) and path not in found:
+            found.append(path)
+
+    for seg in segments:
+        # Strip leading negation and shell variable assignments.
+        idx = 0
+        while idx < len(seg) and seg[idx] == "!":
+            idx += 1
+        while idx < len(seg) and _ENV_ASSIGN_RE.match(seg[idx]):
+            idx += 1
+        if idx >= len(seg):
+            continue
+
+        # Parse redirections and build argv.
+        argv: list[str] = []
+        j = idx
+        while j < len(seg):
+            tok = seg[j]
+            if tok == "<":
+                if j + 1 < len(seg):
+                    _add(seg[j + 1])
+                    j += 2
+                    continue
+            if tok in {">", ">>", "<>", ">&", "<&", "<<", "<<<"}:
+                if argv and argv[-1].isdigit():
+                    argv.pop()
+                j += 2
+                continue
+            argv.append(tok)
+            j += 1
+
+        if not argv:
+            continue
+        prog = Path(argv[0]).name
+        args = argv[1:]
+
+        if prog in _SCRIPT_INTERPRETERS:
+            joined = " ".join(argv)
+            for artifact in expected_artifacts:
+                art = artifact.strip() if isinstance(artifact, str) else ""
+                if art and art in joined:
+                    _add(art)
+            continue
+
+        if prog not in (_FILE_CONTENT_WITH_SCRIPT | _FILE_CONTENT_WITH_PATTERN | _FILE_CONTENT_DIRECT):
+            continue
+
+        opts_with_arg = _OPTS_WITH_ARG.get(prog, frozenset())
+        script_flags = _SCRIPT_PROVIDING_FLAGS.get(prog, frozenset())
+        has_script_flag = False
+        is_recursive = False
+        positionals: list[str] = []
+
+        k = 0
+        end_opts = False
+        while k < len(args):
+            arg = args[k]
+            if end_opts:
+                positionals.append(arg)
+                k += 1
+                continue
+            if arg == "--":
+                end_opts = True
+                k += 1
+                continue
+            if arg.startswith("--"):
+                flag_name = arg.split("=", 1)[0]
+                if flag_name in script_flags:
+                    has_script_flag = True
+                if prog in _FILE_CONTENT_WITH_PATTERN and flag_name == "--recursive":
+                    is_recursive = True
+                if "=" not in arg and flag_name in opts_with_arg and k + 1 < len(args):
+                    k += 2
+                    continue
+                k += 1
+                continue
+            if arg.startswith("-") and len(arg) > 1:
+                if arg in script_flags:
+                    has_script_flag = True
+                if prog in _FILE_CONTENT_WITH_PATTERN and ("r" in arg[1:] or "R" in arg[1:]):
+                    is_recursive = True
+                if arg in opts_with_arg and k + 1 < len(args):
+                    k += 2
+                    continue
+                # Handle attached short script flags like -efoo or -ffile
+                if len(arg) > 2 and arg[:2] in script_flags:
+                    has_script_flag = True
+                k += 1
+                continue
+            positionals.append(arg)
+            k += 1
+
+        if prog in _FILE_CONTENT_WITH_SCRIPT:
+            if prog in {"awk", "gawk", "mawk", "nawk"}:
+                if has_script_flag:
+                    candidates = [p for p in positionals if not _ENV_ASSIGN_RE.match(p)]
+                else:
+                    candidates = [p for p in positionals[1:] if not _ENV_ASSIGN_RE.match(p)]
+            else:
+                candidates = positionals if has_script_flag else positionals[1:]
+            for candidate in candidates:
+                _add(candidate)
+        elif prog in _FILE_CONTENT_WITH_PATTERN:
+            candidates = positionals if has_script_flag else positionals[1:]
+            for candidate in candidates:
+                if is_recursive and candidate not in expected_set:
+                    continue
+                _add(candidate)
+        elif prog in _FILE_CONTENT_DIRECT:
+            for candidate in positionals:
+                _add(candidate)
+
+    return found
+
+
+def _split_top_level_and(command: str) -> list[str]:
+    """Split `command` on top-level `&&` only (respecting quotes and grouping)."""
+    parts: list[str] = []
+    start = 0
+    i = 0
+    n = len(command)
+    in_single = False
+    in_double = False
+    escaped = False
+    paren_depth = 0
+    brace_depth = 0
+
+    while i < n:
+        ch = command[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            escaped = True
+            i += 1
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "(":
+            paren_depth += 1
+        elif ch == ")" and paren_depth > 0:
+            paren_depth -= 1
+        elif ch == "{":
+            brace_depth += 1
+        elif ch == "}" and brace_depth > 0:
+            brace_depth -= 1
+        elif paren_depth == 0 and brace_depth == 0 and command[i:i + 2] == "&&":
+            parts.append(command[start:i].strip())
+            i += 2
+            start = i
+            continue
+        i += 1
+    parts.append(command[start:].strip())
+    return parts
+
+
+def _has_top_level_or_or_semi(command: str) -> bool:
+    """Return True if `command` has a top-level `||` or `;` outside quotes/groups."""
+    i = 0
+    n = len(command)
+    in_single = False
+    in_double = False
+    escaped = False
+    paren_depth = 0
+    brace_depth = 0
+
+    while i < n:
+        ch = command[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            escaped = True
+            i += 1
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "(":
+            paren_depth += 1
+        elif ch == ")" and paren_depth > 0:
+            paren_depth -= 1
+        elif ch == "{":
+            brace_depth += 1
+        elif ch == "}" and brace_depth > 0:
+            brace_depth -= 1
+        elif paren_depth == 0 and brace_depth == 0:
+            if ch == ";" or command[i:i + 2] == "||":
+                return True
+        i += 1
+    return False
+
+
+def _parse_simple_file_test(clause: str) -> tuple[str, str] | None:
+    """If `clause` is `test -s/-f <path>` or `[ -s/-f <path> ]`, return `(flag, path)`."""
+    tokens = _tokenize_shell(clause)
+    if not tokens:
+        return None
+    if len(tokens) == 3 and tokens[0] == "test" and tokens[1] in {"-s", "-f"}:
+        return tokens[1], tokens[2]
+    if len(tokens) == 4 and tokens[0] == "[" and tokens[3] == "]" and tokens[1] in {"-s", "-f"}:
+        return tokens[1], tokens[2]
+    return None
+
+
+def guard_verification_command(command: str, expected_artifacts: Sequence[str] = ()) -> str:
+    """Normalize and guard a shell verification command.
+
+    1. Rewrites fragile numeric `test "$(...)" -op N` / `test $(...) -op N`
+       checks so empty/missing output never raises `/bin/sh: test: Illegal number:`.
+    2. Ensures file-content checks require `test -s <path> && ...` first.
+    """
+    normalized = _rewrite_numeric_test_substitutions(command.strip())
+    paths = _extract_file_content_paths(normalized, expected_artifacts)
+    if not paths:
+        return normalized
+
+    clauses = _split_top_level_and(normalized)
+    guarded_paths: set[str] = set()
+    upgraded_clauses = list(clauses)
+
+    # Inspect leading `test -s` / `test -f` clauses (when followed by more clauses).
+    if len(clauses) > 1:
+        for idx, clause in enumerate(clauses[:-1]):
+            parsed = _parse_simple_file_test(clause)
+            if parsed is None:
+                break
+            flag, target = parsed
+            if flag == "-s":
+                guarded_paths.add(target)
+            elif flag == "-f" and target in paths:
+                upgraded_clauses[idx] = f"test -s {shlex.quote(target)}"
+                guarded_paths.add(target)
+
+    rebuilt = " && ".join(upgraded_clauses)
+    missing = [path for path in paths if path not in guarded_paths]
+    if not missing:
+        return rebuilt
+
+    prefix = " && ".join(f"test -s {shlex.quote(path)}" for path in missing)
+    if _has_top_level_or_or_semi(rebuilt):
+        return f"{prefix} && {{ {rebuilt}; }}"
+    return f"{prefix} && {rebuilt}"
+
+
+def _failure_signature(
+    criteria: Sequence[CheckEvidence],
+    artifacts: Sequence[CheckEvidence],
+    commands: Sequence[CommandEvidence],
+) -> str:
+    payload = {
+        "criteria": [[item.item, item.detail] for item in criteria if not item.passed],
+        "artifacts": [[item.item, item.detail] for item in artifacts if not item.passed],
+        "commands": [
+            [item.command, item.returncode, item.stdout.strip(), item.stderr.strip()]
+            for item in commands if not item.passed
+        ],
+    }
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
 
 def _text(value: object, field: str) -> str:
@@ -177,6 +799,8 @@ class ProjectManager:
     optional standalone ``run`` counts one hop per worker dispatch.
     """
 
+    guard_verification_command = staticmethod(guard_verification_command)
+
     def __init__(
         self,
         planner: Executor | None = None,
@@ -196,8 +820,15 @@ class ProjectManager:
             raise ValueError("workspace must be an existing directory")
         self.max_hops = max_hops
         self.command_timeout = command_timeout
+        self._last_failure_signatures: dict[tuple[str, str, str], tuple[int, str]] = {}
 
-    async def decompose_goal(self, task, executor: Executor | None = None) -> MilestoneDAG:
+    async def decompose_goal(
+        self,
+        task,
+        executor: Executor | None = None,
+        rolodex_text: str | None = None,
+        skills_text: str = "",
+    ) -> MilestoneDAG:
         """Ask the planner for a validated DAG of shared MilestoneTask models."""
         from dagger.schema import MilestoneTask
 
@@ -215,7 +846,14 @@ class ProjectManager:
             "the same array index; commands must exit zero only if the criterion is met. "
             "Commands execute as shell checks in the worktree; any expected artifact "
             "paths must be worktree-relative. Use an empty artifact list when none apply. "
+            "File-content checks must guard each target file with `test -s <path> && ...` first. "
+            "Never emit `test \"$(awk ...)\" -ge N` or unquoted `test $(awk ...) -ge N` "
+            "comparisons that fail with `/bin/sh: test: Illegal number:`; use "
+            "`test -s <path> && awk '... END { exit !(c+0 >= N) }' <path>` or "
+            "`test -s <path> && grep -q ... <path>` instead. "
             "Include concrete, independently checkable criteria and commands.\n"
+            + (f"Available Agent Rolodex:\n{rolodex_text}\n" if rolodex_text else "")
+            + (f"Available Workspace Skills:\n{skills_text}\n" if skills_text else "")
             + json.dumps({"title": task.title, "description": task.description}, ensure_ascii=False)
         )
         response = await planner(prompt)
@@ -244,8 +882,26 @@ class ProjectManager:
             dod = milestone.dod
             if not dod.acceptance_criteria or len(dod.verification_commands) < len(dod.acceptance_criteria):
                 raise ValueError("every acceptance criterion requires a verification command")
-            for item in [*dod.acceptance_criteria, *dod.verification_commands, *dod.expected_artifacts]:
+            for item in [
+                *dod.acceptance_criteria,
+                *dod.verification_commands,
+                *dod.expected_artifacts,
+                *milestone.allowed_write_paths,
+            ]:
                 _text(item, "definition of done entry")
+            guarded_commands = [
+                guard_verification_command(command, dod.expected_artifacts)
+                for command in dod.verification_commands
+            ]
+            allowed_write_paths = list(
+                dict.fromkeys([*milestone.allowed_write_paths, *dod.expected_artifacts])
+            )
+            milestone = milestone.model_copy(
+                update={
+                    "dod": dod.model_copy(update={"verification_commands": guarded_commands}),
+                    "allowed_write_paths": allowed_write_paths,
+                }
+            )
             milestones.append(milestone)
         visiting, visited = set(), set()
 
@@ -267,7 +923,13 @@ class ProjectManager:
         return MilestoneDAG(tuple(milestones), dependencies)
 
     async def audit_milestone(
-        self, milestone, worktree_path: str | Path, hop_count: int = 0, max_hops: int | None = None
+        self,
+        milestone,
+        worktree_path: str | Path,
+        hop_count: int = 0,
+        max_hops: int | None = None,
+        *,
+        run_id: str | None = None,
     ) -> MilestoneAudit:
         """Audit a milestone using command exits and workspace-relative artifacts.
 
@@ -285,13 +947,17 @@ class ProjectManager:
         commands = []
         for command in milestone.dod.verification_commands:
             try:
-                criterion = Criterion(command, ("/bin/sh", "-c", _text(command, "verification command")))
+                guarded = guard_verification_command(
+                    _text(command, "verification command"),
+                    milestone.dod.expected_artifacts,
+                )
+                criterion = Criterion(guarded, ("/bin/sh", "-c", guarded))
             except ValueError as exc:
                 commands.append(CommandEvidence(command, False, None, "", str(exc)))
                 continue
             task = PlannedTask(milestone.milestone_id, milestone.title, (criterion,))
             result = (await checker.verify(task))[0]
-            commands.append(CommandEvidence(command, result.passed, result.returncode, result.stdout, result.stderr))
+            commands.append(CommandEvidence(guarded, result.passed, result.returncode, result.stdout, result.stderr))
         criteria = []
         for index, item in enumerate(milestone.dod.acceptance_criteria):
             passed = bool(item.strip()) and index < len(commands) and commands[index].passed
@@ -324,9 +990,32 @@ class ProjectManager:
             f"command {result.command!r} failed (exit={result.returncode}): {result.stderr or result.stdout}"
             for result in commands if not result.passed
         )
+        history_key = (run_id or "", str(worktree), milestone.milestone_id)
+        duplicate_failure = False
+        if passed:
+            self._last_failure_signatures.pop(history_key, None)
+            human_review_required = False
+        else:
+            signature = _failure_signature(criteria, artifacts, commands)
+            previous = self._last_failure_signatures.get(history_key)
+            duplicate_failure = (
+                previous is not None
+                and hop_count >= previous[0]
+                and previous[1] == signature
+            )
+            human_review_required = unverifiable or hop_count >= limit or duplicate_failure
+            if human_review_required:
+                self._last_failure_signatures.pop(history_key, None)
+            else:
+                self._last_failure_signatures[history_key] = (hop_count, signature)
+            if duplicate_failure:
+                failures.append(
+                    "Duplicate failure signature on consecutive attempts; escalating to human review."
+                )
         return MilestoneAudit(
             "DOD_PASSED" if passed else "DOD_FAILED",
-            "\n".join(failures), not passed and (unverifiable or hop_count >= limit),
+            "\n".join(failures),
+            human_review_required,
             tuple(criteria), tuple(artifacts), tuple(commands),
         )
 
@@ -442,6 +1131,7 @@ class ProjectManager:
         plan = await self.create_plan(goal)
         pending = list(plan.tasks)
         previous: dict[str, tuple[VerificationResult, ...]] = {}
+        last_failure_sig: dict[str, tuple[tuple[str, int | None, str, str], ...]] = {}
         outputs: list[tuple[str, str]] = []
         audits: list[AuditReport] = []
         hops = 0
@@ -452,7 +1142,16 @@ class ProjectManager:
             outputs.append((task.id, output))
             results = await self.verify(task)
             previous[task.id] = results
-            if not all(result.passed for result in results):
+            if all(result.passed for result in results):
+                last_failure_sig.pop(task.id, None)
+            else:
+                sig = tuple(
+                    (r.criterion.description, r.returncode, r.stdout.strip(), r.stderr.strip())
+                    for r in results if not r.passed
+                )
+                if last_failure_sig.get(task.id) == sig:
+                    return ProjectReport(plan, "human_review_required", hops, tuple(audits), tuple(outputs))
+                last_failure_sig[task.id] = sig
                 pending.append(task)
             if not pending and len(previous) == len(plan.tasks):
                 # Check all tasks again: later work may have broken earlier work.

@@ -1,0 +1,22 @@
+container_id: groq_fast_router
+name: Groq Fast Router
+version: 1
+role: fast_router
+provider: api
+model: llama-3.3-70b-versatile
+system_prompt: ''
+allowed_tools:
+- read
+- search
+fallback_providers: []
+strengths:
+- triage
+- routing
+- review
+- analysis
+cost_tier: metered_api
+max_concurrency: 2
+base_url: https://api.groq.com/openai/v1
+api_key_env: null
+active: true
+use_token_auth: false

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "codescalpel": {
+      "type": "local",
+      "command": "uvx",
+      "args": [
+        "--with",
+        "mcp==1.30.0",
+        "codescalpel@2.1.4",
+        "mcp"
+      ],
+      "tools": [
+        "*"
+      ]
+    }
+  }
+}

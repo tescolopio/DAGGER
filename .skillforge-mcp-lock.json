@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "codex/codescalpel": "0f0df7b867c24c9ccd2ff0d875177a92203c815281c53dc9f277c35fbfc5ba5a",
+    "copilot/codescalpel": "964c200d09c80f49ddfd685b04825604684b7ff70ae239cc4b54dcf5aadb2006",
+    "cursor/codescalpel": "8deb8e6c847f1ac276cdc8a44eea73b63a20ac7e5d57420eb76a0666daeb91e6",
+    "gemini/codescalpel": "a1eba78c4518665cedfe5c702530375131828472d1ec29b6c72319113bf76b90",
+    "mcp-json/codescalpel": "a1eba78c4518665cedfe5c702530375131828472d1ec29b6c72319113bf76b90"
+  },
+  "version": 1
+}

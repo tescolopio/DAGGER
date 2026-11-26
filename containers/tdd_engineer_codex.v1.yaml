@@ -1,0 +1,24 @@
+container_id: tdd_engineer_codex
+name: Codex TDD Engineer
+version: 1
+role: tdd_engineer
+provider: codex
+model: gpt-5-codex
+system_prompt: Implement changes with focused tests and verify behavior.
+allowed_tools:
+- read
+- search
+- write
+- shell
+fallback_providers:
+- claude
+- copilot
+strengths:
+- coding
+- testing
+cost_tier: flat_subscription
+max_concurrency: 2
+base_url: null
+api_key_env: null
+active: false
+use_token_auth: false

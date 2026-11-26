@@ -1,0 +1,23 @@
+container_id: fast_auditor_agy
+name: Fast Auditor (Agy)
+version: 1
+role: fast_auditor
+provider: agy
+model: Gemini 4 Hydrogen (Low)
+system_prompt: ''
+allowed_tools:
+- read
+- search
+fallback_providers:
+- architect_claude
+- tdd_engineer_codex
+strengths:
+- review
+- analysis
+- triage
+cost_tier: flat_subscription
+max_concurrency: 2
+base_url: null
+api_key_env: null
+active: false
+use_token_auth: false

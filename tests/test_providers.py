@@ -95,7 +95,8 @@ async def test_copilot_token_auth_opt_in(monkeypatch, agent, task):
     assert await CopilotCliRunner().run(agent, task) == "answer"
 
 
-async def test_codex_output_file_and_cleanup(monkeypatch, agent, task):
+async def test_codex_output_file_and_cleanup(monkeypatch, tmp_path, agent, task):
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OPENAI_API_KEY", "example")
     paths = []
 

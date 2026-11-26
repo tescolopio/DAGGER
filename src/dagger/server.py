@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +15,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import anyio
+import httpx
 import yaml
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -25,10 +28,21 @@ from dagger.agents.orchestrator import Orchestrator
 from dagger.agents.project_manager import ProjectManager
 from dagger.bus import EventBus
 from dagger.db import DatabaseManager
-from dagger.schema import AgentContainer, DefinitionOfDone, KanbanTask, TaskEnvelope
+from dagger.schema import (
+    AgentContainer,
+    DefinitionOfDone,
+    KanbanTask,
+    ProviderCredentialStatus,
+    TaskEnvelope,
+)
 from dagger.providers import ProviderRegistry
+from dagger.vault import get_vault_credential, save_provider_credentials
 
 logger = logging.getLogger(__name__)
+
+
+class LoginCompleteRequest(BaseModel):
+    input: str
 
 
 def _trusted_websocket_origin(websocket: WebSocket) -> bool:
@@ -58,6 +72,17 @@ class RunRequest(BaseModel):
 
 class ReviewRequest(BaseModel):
     decision: bool | str | dict[str, Any]
+
+
+class CredentialsRequest(BaseModel):
+    provider: str
+    api_key: str
+    base_url: str | None = None
+
+
+class DownshiftRequest(BaseModel):
+    target_model: str | None = None
+    target_container_id: str | None = None
 
 
 def create_app(
@@ -96,7 +121,10 @@ def create_app(
                 if result is None or result[0] != "ok":
                     raise RuntimeError(f"Checkpoint database integrity check failed: {result}")
                 bus = EventBus()
-                registry = ProviderRegistry()
+                try:
+                    registry = ProviderRegistry(db=db)
+                except TypeError:
+                    registry = ProviderRegistry()
 
                 async def execute(prompt: str) -> str:
                     containers = await db.list_containers()
@@ -114,6 +142,8 @@ def create_app(
                     )
                     if container is None:
                         raise RuntimeError("No available agent container is configured")
+                    manager.provider = container.provider
+                    manager.model = container.model
                     result = await registry.get(container.provider).run(
                         container, TaskEnvelope(
                             task_id=str(uuid4()), run_id=str(uuid4()), kanban_id=str(uuid4()),
@@ -166,6 +196,7 @@ def create_app(
                 app.state.generator = generator
                 app.state.jobs = jobs
                 app.state.active_runs = set()
+                app.state.login_sessions = {}
 
                 async def watch_bus() -> None:
                     async for changes in awatch(bus_path):
@@ -184,6 +215,9 @@ def create_app(
                         watcher.cancel()
                     for job in jobs:
                         job.cancel()
+                    for session in list(app.state.login_sessions.values()):
+                        await _terminate_login_session(session)
+                    app.state.login_sessions.clear()
                     await asyncio.gather(*watchers, *jobs, return_exceptions=True)
                     await generator.aclose()
         finally:
@@ -240,9 +274,396 @@ def create_app(
     async def refresh_catalog():
         return await app.state.generator.refresh_catalog()
 
+    @app.get("/api/providers/status")
+    async def providers_status():
+        capabilities = await app.state.db.list_capabilities()
+        providers: list[dict[str, Any]] = []
+        cli_specs = [
+            ("claude", "Claude Code CLI", "claude"),
+            ("codex", "Codex CLI", "codex"),
+            ("gemini", "Gemini CLI", "gemini"),
+            ("copilot", "GitHub Copilot CLI", "copilot"),
+            ("agy", "Antigravity CLI", "agy"),
+        ]
+        for pid, display, binary in cli_specs:
+            found = shutil.which(binary)
+            prov_caps = [item for item in capabilities if item.provider == pid]
+            if not found:
+                status = "missing_binary"
+                detail = f"{binary} binary not found in PATH"
+            elif pid == "gemini":
+                from dagger.agents.generator import _has_gemini_auth
+
+                if not _has_gemini_auth():
+                    status = "expired"
+                    detail = "gemini CLI found, but no active selectedType/oauth_creds.json or API/Vertex/GCA env"
+                elif prov_caps and not any(item.healthy for item in prov_caps):
+                    status = "expired"
+                    detail = f"{binary} found at {found}, but health check failed"
+                else:
+                    status = "authenticated"
+                    detail = f"Found at {found}"
+            elif prov_caps and not any(item.healthy for item in prov_caps):
+                status = "expired"
+                detail = f"{binary} found at {found}, but health check failed"
+            else:
+                status = "authenticated"
+                detail = f"Found at {found}"
+            providers.append(
+                ProviderCredentialStatus(
+                    provider_id=pid,
+                    display_name=display,
+                    kind="subscription_cli",
+                    status=status,
+                    detail=detail,
+                    supports_login=True,
+                    supports_api_key=False,
+                ).model_dump()
+            )
+        for pid, display, env_key in (
+            ("groq", "Groq API", "GROQ_API_KEY"),
+            ("tavily", "Tavily Search API", "TAVILY_API_KEY"),
+        ):
+            configured = bool(get_vault_credential(env_key))
+            providers.append(
+                ProviderCredentialStatus(
+                    provider_id=pid,
+                    display_name=display,
+                    kind="api_key",
+                    status="api_key_configured" if configured else "unconfigured",
+                    detail="Configured in local vault/env" if configured else "No API key configured",
+                    supports_login=False,
+                    supports_api_key=True,
+                ).model_dump()
+            )
+        local_healthy = any(
+            item.cost_tier == "local_free" and item.healthy for item in capabilities
+        )
+        providers.append(
+            ProviderCredentialStatus(
+                provider_id="local",
+                display_name="Local OpenAI-Compatible",
+                kind="local",
+                status="authenticated" if local_healthy else "unconfigured",
+                detail="Healthy local endpoint detected" if local_healthy else "No local endpoint active",
+                supports_login=False,
+                supports_api_key=False,
+            ).model_dump()
+        )
+        return {"providers": providers}
+
+    async def _terminate_login_session(session: dict[str, Any] | None) -> None:
+        if not session:
+            return
+        proc = session.get("proc")
+        if proc is None or getattr(proc, "returncode", None) is not None:
+            return
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
+            except (ProcessLookupError, asyncio.TimeoutError):
+                pass
+
+    async def _read_available_output(proc: Any, timeout: float = 2.0) -> str:
+        """Read available stdout/stderr incrementally without killing a waiting process."""
+        stdout_stream = getattr(proc, "stdout", None)
+        stderr_stream = getattr(proc, "stderr", None)
+        has_async_streams = any(
+            asyncio.iscoroutinefunction(getattr(s, "read", None))
+            for s in (stdout_stream, stderr_stream)
+            if s is not None
+        )
+        if not has_async_streams:
+            if hasattr(proc, "communicate"):
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                    return (
+                        (stdout or b"").decode(errors="replace")
+                        + "\n"
+                        + (stderr or b"").decode(errors="replace")
+                    ).strip()
+                except asyncio.TimeoutError:
+                    return ""
+            return ""
+
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+
+        tasks: dict[asyncio.Task[bytes], tuple[Any, list[str]]] = {}
+        for stream, target in ((stdout_stream, stdout_chunks), (stderr_stream, stderr_chunks)):
+            if stream is not None:
+                tasks[asyncio.create_task(stream.read(4096))] = (stream, target)
+
+        try:
+            while tasks:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                combined = "".join(stdout_chunks) + "\n" + "".join(stderr_chunks)
+                url_seen = bool(re.search(r"https?://\S+", combined))
+                wait_timeout = min(0.2, remaining) if url_seen else remaining
+                done, _ = await asyncio.wait(
+                    tasks.keys(),
+                    timeout=wait_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    if url_seen:
+                        break
+                    continue
+                for task in done:
+                    stream, target = tasks.pop(task)
+                    try:
+                        data = task.result()
+                    except Exception:
+                        continue
+                    if data:
+                        target.append(data.decode(errors="replace"))
+                        tasks[asyncio.create_task(stream.read(4096))] = (stream, target)
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks.keys(), return_exceptions=True)
+
+        stdout_text = "".join(stdout_chunks).strip()
+        stderr_text = "".join(stderr_chunks).strip()
+        return "\n".join(part for part in (stdout_text, stderr_text) if part)
+
+
+    @app.post("/api/providers/{provider_id}/login")
+    async def provider_login(provider_id: str):
+        login_cmds = {
+            "claude": ["claude", "auth", "login"],
+            "codex": ["codex", "login"],
+            "gemini": ["gemini"],
+            "copilot": ["copilot", "auth", "login"],
+            "agy": ["agy", "auth", "login"],
+        }
+        pid = provider_id.lower()
+        cmd = login_cmds.get(pid)
+        if cmd is None:
+            raise HTTPException(status_code=400, detail=f"Login not supported for provider: {provider_id}")
+        if not shutil.which(cmd[0]):
+            return {
+                "provider_id": pid,
+                "status": "missing_binary",
+                "message": f"{cmd[0]} binary not found in PATH",
+                "auth_url": None,
+                "device_url": None,
+                "device_code": None,
+            }
+        login_sessions: dict[str, dict[str, Any]] = getattr(app.state, "login_sessions", {})
+        app.state.login_sessions = login_sessions
+        await _terminate_login_session(login_sessions.pop(pid, None))
+        try:
+            env = os.environ.copy()
+            for key in (
+                "GROQ_API_KEY",
+                "TAVILY_API_KEY",
+                "DAGGER_API_KEY",
+                "DAGGER_API_BASE_URL",
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "GITHUB_TOKEN",
+                "GH_TOKEN",
+            ):
+                env.pop(key, None)
+            env["BROWSER"] = "echo"
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            output = await _read_available_output(proc, timeout=2.0)
+        except OSError as exc:
+            return {
+                "provider_id": pid,
+                "status": "error",
+                "message": str(exc),
+                "auth_url": None,
+                "device_url": None,
+                "device_code": None,
+            }
+        url_match = re.search(r"https?://\S+", output)
+        code_match = re.search(r"\b[A-Z0-9]{4}-[A-Z0-9]{4}\b", output)
+        auth_url = url_match.group(0).rstrip(".,)\"'<>]") if url_match else None
+        device_code = code_match.group(0) if code_match else None
+        if getattr(proc, "returncode", None) not in (None, 0) and auth_url is None and device_code is None:
+            return {
+                "provider_id": pid,
+                "status": "error",
+                "message": output or f"{pid} login exited with code {proc.returncode}",
+                "auth_url": None,
+                "device_url": None,
+                "device_code": None,
+            }
+        login_sessions[pid] = {
+            "proc": proc,
+            "auth_url": auth_url,
+            "device_code": device_code,
+            "output": output,
+        }
+        return {
+            "provider_id": pid,
+            "status": "awaiting_callback",
+            "message": output or f"Started {pid} login flow",
+            "auth_url": auth_url,
+            "device_url": auth_url,
+            "device_code": device_code,
+        }
+
+    @app.post("/api/providers/{provider_id}/login/complete")
+    async def provider_login_complete(provider_id: str, req: LoginCompleteRequest):
+        pid = provider_id.lower()
+        login_sessions: dict[str, dict[str, Any]] = getattr(app.state, "login_sessions", {})
+        session = login_sessions.get(pid)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"No active login session for provider: {provider_id}")
+        raw = req.input.strip()
+        if not raw:
+            raise HTTPException(status_code=400, detail="Input must not be empty")
+
+        proc = session["proc"]
+        lowered = raw.lower()
+        target_url: str | None = None
+        if lowered.startswith("http://") or lowered.startswith("https://"):
+            try:
+                parsed = urlsplit(raw)
+                port = parsed.port
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid callback URL: only http://localhost:<port> or http://127.0.0.1:<port> is allowed",
+                ) from None
+            if (
+                parsed.scheme != "http"
+                or parsed.hostname not in {"localhost", "127.0.0.1"}
+                or parsed.username is not None
+                or parsed.password is not None
+                or port is None
+                or not (1 <= port <= 65535)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid callback URL: only http://localhost:<port> or http://127.0.0.1:<port> is allowed",
+                )
+            target_url = f"http://127.0.0.1:{port}{parsed.path or ''}"
+            if parsed.query:
+                target_url = f"{target_url}?{parsed.query}"
+
+        try:
+            if target_url is not None:
+                try:
+                    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+                        await client.get(target_url)
+                except (httpx.HTTPError, OSError) as exc:
+                    logger.warning("Localhost callback relay failed for %s: %s", pid, exc)
+            else:
+                stdin = getattr(proc, "stdin", None)
+                if stdin is not None:
+                    try:
+                        stdin.write((raw + "\n").encode("utf-8"))
+                        if hasattr(stdin, "drain"):
+                            await stdin.drain()
+                    except (BrokenPipeError, OSError) as exc:
+                        logger.warning("Failed writing login code to %s stdin: %s", pid, exc)
+
+            if getattr(proc, "returncode", None) is None and hasattr(proc, "wait"):
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    await _terminate_login_session(session)
+        finally:
+            await _terminate_login_session(session)
+            login_sessions.pop(pid, None)
+
+        await app.state.generator.refresh_catalog()
+        status_payload = await providers_status()
+        for item in status_payload.get("providers", []):
+            if item.get("provider_id") == pid:
+                return item
+        raise HTTPException(status_code=404, detail=f"Provider status not found for: {provider_id}")
+
+    @app.post("/api/providers/credentials")
+    async def save_credentials(req: CredentialsRequest):
+        try:
+            save_provider_credentials(req.provider, req.api_key, base_url=req.base_url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        await app.state.generator.refresh_catalog()
+        caps = await app.state.db.list_capabilities()
+        return {"status": "saved", "provider": req.provider.lower(), "catalog_count": len(caps)}
+
+    @app.get("/api/usage/summary")
+    async def usage_summary():
+        return await app.state.db.get_usage_summary()
+
+    @app.get("/api/rolodex")
+    async def rolodex():
+        entries = await app.state.generator.get_rolodex()
+        text = app.state.generator.generate_rolodex_text(entries)
+        return {"entries": entries, "text": text}
+
+    @app.get("/api/skills")
+    async def list_skills():
+        from .skills import discover_skills
+
+        workspace_root = getattr(app.state, "workspace_root", Path.cwd())
+        skills = discover_skills(workspace_root)
+        counts_by_source: dict[str, int] = {}
+        for skill in skills:
+            counts_by_source[skill.source] = counts_by_source.get(skill.source, 0) + 1
+        return {
+            "skills": [s.to_summary().model_dump() for s in skills],
+            "count": len(skills),
+            "sources": counts_by_source,
+        }
+
+    @app.post("/api/containers/{container_id}/downshift")
+    async def downshift_container(container_id: str, req: DownshiftRequest | None = None):
+        body = req or DownshiftRequest()
+        try:
+            container = await app.state.generator.downshift_container(
+                container_id,
+                target_model=body.target_model,
+                target_container_id=body.target_container_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from None
+        return {"status": "downshifted", "container": container}
+
     @app.get("/api/tasks")
     async def tasks():
         return await app.state.db.list_tasks()
+
+    @app.get("/api/tasks/{task_id}/logs")
+    async def task_logs(task_id: str, run_id: str | None = None, limit: int = 500):
+        if not (1 <= limit <= 2000):
+            raise HTTPException(status_code=422, detail="limit must be between 1 and 2000")
+        task = await app.state.db.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        effective_run_id = run_id if run_id is not None else task.run_id
+        logs = await app.state.db.list_card_logs(task_id, run_id=run_id, limit=limit)
+        return {
+            "task_id": task_id,
+            "run_id": effective_run_id,
+            "logs": logs,
+        }
 
     @app.post("/api/tasks", status_code=201)
     async def create_task(payload: dict[str, Any]):

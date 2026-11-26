@@ -1,0 +1,22 @@
+container_id: architect_claude
+name: Claude Architect
+version: 1
+role: architect
+provider: claude
+model: claude-sonnet-4-5
+system_prompt: Design clear, maintainable solutions and review architecture.
+allowed_tools:
+- read
+- search
+fallback_providers:
+- gemini
+- codex
+strengths:
+- architecture
+- reasoning
+cost_tier: flat_subscription
+max_concurrency: 2
+base_url: null
+api_key_env: null
+active: false
+use_token_auth: false

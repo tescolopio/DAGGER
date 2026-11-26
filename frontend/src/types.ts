@@ -1,5 +1,5 @@
 export type TaskStatus = 'Backlog' | 'Planning' | 'Running' | 'DoD Audit' | 'Review' | 'Done' | 'Failed';
-export type GraphEventType = 'NODE_SPAWNED' | 'EDGE_TRAVERSED' | 'DOD_PASSED' | 'DOD_FAILED' | 'HUMAN_GATE' | 'COMPLETED' | 'FAILED' | 'FALLBACK';
+export type GraphEventType = 'NODE_SPAWNED' | 'EDGE_TRAVERSED' | 'DOD_PASSED' | 'DOD_FAILED' | 'HUMAN_GATE' | 'COMPLETED' | 'FAILED' | 'FALLBACK' | 'SWARM_POST';
 
 export interface Task {
   task_id: string;
@@ -18,6 +18,7 @@ export interface Agent {
   model: string | null;
   strengths?: string[];
   active: boolean;
+  [key: string]: unknown;
 }
 
 export interface Capability {
@@ -32,6 +33,11 @@ export interface Capability {
   last_checked?: string | null;
 }
 
+export interface GraphEventMetadata extends Record<string, unknown> {
+  skills?: string[];
+  allowed_mcp_tools?: string[];
+}
+
 export interface GraphEvent {
   event_id: string;
   timestamp: string;
@@ -40,8 +46,144 @@ export interface GraphEvent {
   event_type: GraphEventType;
   source_node?: string | null;
   target_node: string;
+  node_id?: string | null;
+  summary?: string;
   provider: string;
   container_id?: string | null;
   label: string;
-  metadata: Record<string, unknown>;
+  metadata: GraphEventMetadata;
+}
+
+export type ProviderStatusKind = 'subscription_cli' | 'api_key' | 'local';
+export type ProviderAuthStatus =
+  | 'authenticated'
+  | 'expired'
+  | 'missing_binary'
+  | 'api_key_configured'
+  | 'unconfigured';
+
+export interface ProviderStatus {
+  provider_id: string;
+  display_name: string;
+  kind: ProviderStatusKind | string;
+  status: ProviderAuthStatus | string;
+  detail: string;
+  supports_login: boolean;
+  supports_api_key: boolean;
+}
+
+export interface ProviderLoginResponse {
+  provider_id: string;
+  status: string;
+  message: string;
+  auth_url?: string | null;
+  device_url?: string | null;
+  device_code?: string | null;
+}
+
+export interface ProviderCredentialResponse {
+  status: string;
+  provider: string;
+  catalog_count: number;
+}
+
+export interface SubscriptionUsage {
+  provider: string;
+  calls_3h: number;
+  calls_24h: number;
+  soft_limit_3h: number;
+  soft_limit_24h: number;
+  utilization_3h: number;
+}
+
+export interface DailyTrendPoint {
+  date: string;
+  cost_usd: number;
+  calls: number;
+}
+
+export interface MeteredUsage {
+  total_cost_usd: number;
+  cost_7d_usd: number;
+  total_calls: number;
+  daily_trend: DailyTrendPoint[];
+}
+
+export interface DownshiftSuggestion {
+  container_id: string;
+  current_model: string;
+  suggested_container_id: string;
+  suggested_model: string;
+  reason: string;
+  estimated_savings_pct: number;
+}
+
+export interface UsageSummary {
+  subscriptions: SubscriptionUsage[];
+  metered: MeteredUsage;
+  downshift_suggestions: DownshiftSuggestion[];
+  total_events: number;
+}
+
+export interface RolodexEntry {
+  container_id: string;
+  provider: string;
+  model: string | null;
+  role: string;
+  cost_tier: string;
+  cost_rank: number;
+  skills: string[];
+  active: boolean;
+  line: string;
+}
+
+export interface RolodexResponse {
+  entries: RolodexEntry[];
+  text: string;
+}
+
+export interface DownshiftResponse {
+  status: string;
+  container: Agent;
+}
+
+export type SkillSource = 'dagger_local' | 'skillforge' | 'workspace';
+
+export interface SkillSummary {
+  name: string;
+  description: string;
+  source: SkillSource | string;
+  path: string;
+  locations: string[];
+  tags: string[];
+  allowed_tools: string[];
+  valid: boolean;
+  validation_errors: string[];
+}
+
+export interface SkillsResponse {
+  skills: SkillSummary[];
+  count: number;
+  sources: Record<string, number>;
+}
+
+export type CardLogChannel = 'dialogue' | 'stdout' | 'stderr' | 'command' | 'system';
+
+export interface CardLogEntry {
+  event_type?: 'CARD_LOG';
+  log_id: string;
+  kanban_id: string;
+  run_id: string;
+  milestone_id?: string | null;
+  node_id: string;
+  provider: string;
+  channel: CardLogChannel;
+  text: string;
+  ts: string;
+}
+
+export interface CardLogsResponse {
+  task_id: string;
+  run_id: string | null;
+  logs: CardLogEntry[];
 }

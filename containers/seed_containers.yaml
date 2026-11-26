@@ -32,6 +32,17 @@ containers:
     fallback_providers: [claude, codex]
     strengths: [review, analysis]
     cost_tier: flat_subscription
+  - container_id: fast_auditor_gemini
+    name: Gemini Fast Auditor
+    version: 1
+    role: fast_auditor
+    provider: gemini
+    model: gemini-3.8-flash
+    system_prompt: Rapidly audit repository changes, triage issues, and summarize findings.
+    allowed_tools: [read, search]
+    fallback_providers: [claude, codex]
+    strengths: [review, analysis, triage]
+    cost_tier: flat_subscription
   - container_id: copilot_patcher
     name: Copilot Patcher
     version: 1

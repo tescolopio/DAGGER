@@ -5,6 +5,7 @@ __pycache__/
 .test-tmp/
 .pytest-data-check/
 .dagger-pytest-tmp/
+.dagger/
 .env
 *.sqlite
 *.sqlite-*
@@ -16,3 +17,4 @@ bus/
 data/
 frontend/node_modules/
 frontend/dist/
+.code-scalpel/license/

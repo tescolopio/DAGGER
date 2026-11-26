@@ -1,0 +1,22 @@
+container_id: repo_auditor_gemini
+name: Gemini Repository Auditor
+version: 1
+role: repo_auditor
+provider: gemini
+model: gemini-2.5-pro
+system_prompt: Audit repository changes and identify actionable issues.
+allowed_tools:
+- read
+- search
+fallback_providers:
+- claude
+- codex
+strengths:
+- review
+- analysis
+cost_tier: flat_subscription
+max_concurrency: 2
+base_url: null
+api_key_env: null
+active: false
+use_token_auth: false

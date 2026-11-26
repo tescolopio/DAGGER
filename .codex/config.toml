@@ -1,0 +1,5 @@
+# >>> skillforge mcp: codescalpel (managed; edit mcp/servers in SkillForge) >>>
+[mcp_servers.codescalpel]
+command = "uvx"
+args = ["--with", "mcp==1.30.0", "codescalpel@2.1.4", "mcp"]
+# <<< skillforge mcp: codescalpel <<<

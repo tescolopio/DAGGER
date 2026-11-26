@@ -35,13 +35,15 @@ async def test_refresh_probes_persists_and_exports(tmp_path, monkeypatch):
                 "content": "Context window: 300K tokens\nStrengths: coding\nWeaknesses: latency",
             }]
 
+        monkeypatch.setenv("DAGGER_CREDENTIALS_FILE", str(tmp_path / "creds.env"))
         monkeypatch.setattr(generator, "_command", command)
         monkeypatch.setattr(generator, "_probe_local", local_models)
         monkeypatch.setattr(generator, "discover_web", research)
         containers = await generator.refresh_catalog()
         assert {item.container_id for item in containers} == {
             "architect_claude", "tdd_engineer_codex", "repo_auditor_gemini",
-            "copilot_patcher", "local_triage",
+            "fast_auditor_gemini", "fast_auditor_agy", "repo_auditor_agy",
+            "agy_swarm_squad", "copilot_patcher", "local_triage",
         }
         capabilities = {item.provider: item for item in await db.list_capabilities()}
         assert capabilities["claude"].healthy and capabilities["claude"].version == "1.2.3"
