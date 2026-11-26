@@ -943,15 +943,27 @@ def test_agy_cli_runner_model_and_effort_normalization():
 
 
 async def test_generator_seeds_valid_agy_model_effort_strings(tmp_path):
-    from dagger.agents.generator import AgentGenerator
-    from dagger.db import DatabaseManager
+    from dagger.schema import EndpointCapability
 
-    db = DatabaseManager(tmp_path / "test.db")
-    gen = AgentGenerator(db)
-    gen._probe_cli = lambda c: __import__("asyncio").sleep(0)  # type: ignore[method-assign]
-    gen._probe_local = lambda: __import__("asyncio").sleep(0, result=[])  # type: ignore[method-assign]
-    gen.discover_web = lambda: __import__("asyncio").sleep(0, result=[])  # type: ignore[method-assign]
-    seeds = {c.container_id: c for c in await gen.refresh_catalog()}
+    async def fake_probe_cli(container: AgentContainer) -> EndpointCapability:
+        # Mirror the real _probe_cli contract: always return a capability, never None.
+        return EndpointCapability(
+            provider=container.provider, model_name=container.model or "default", healthy=False
+        )
+
+    async def no_local_models() -> list[str]:
+        return []
+
+    async def no_web_findings() -> list[dict[str, str]]:
+        return []
+
+    # Close the DB on exit: a leaked aiosqlite connection thread keeps the interpreter alive.
+    async with DatabaseManager(tmp_path / "test.db") as db:
+        gen = AgentGenerator(db)
+        gen._probe_cli = fake_probe_cli  # type: ignore[method-assign]
+        gen._probe_local = no_local_models  # type: ignore[method-assign]
+        gen.discover_web = no_web_findings  # type: ignore[method-assign]
+        seeds = {c.container_id: c for c in await gen.refresh_catalog()}
     assert seeds["fast_auditor_agy"].model == "Gemini 4 Hydrogen (Low)"
     assert seeds["repo_auditor_agy"].model == "Gemini 4 Neon (High)"
     assert seeds["agy_swarm_squad"].model == "Gemini 4 Neon (High)"

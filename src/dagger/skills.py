@@ -19,8 +19,10 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _MUTATING_TOOLS = frozenset({
     "write", "edit", "patch", "shell", "bash", "sh", "powershell", "pwsh",
     "execute", "run", "delete", "rm", "update_symbol", "rename_symbol",
-    "delete_symbol", "simulate_refactor",
+    "delete_symbol",
 })
+# Code Scalpel 2.1.4 exposes 23 tools. Only update_symbol and rename_symbol write files;
+# simulate_refactor and generate_unit_tests return analysis text and never touch disk.
 READ_ONLY_CODESCALPEL_MCP_TOOLS: tuple[str, ...] = (
     "mcp__codescalpel__extract_code",
     "mcp__codescalpel__get_symbol_references",
@@ -29,12 +31,24 @@ READ_ONLY_CODESCALPEL_MCP_TOOLS: tuple[str, ...] = (
     "mcp__codescalpel__analyze_code",
     "mcp__codescalpel__security_scan",
     "mcp__codescalpel__scan_dependencies",
+    "mcp__codescalpel__get_file_context",
+    "mcp__codescalpel__get_project_map",
+    "mcp__codescalpel__get_graph_neighborhood",
+    "mcp__codescalpel__crawl_project",
+    "mcp__codescalpel__cross_file_security_scan",
+    "mcp__codescalpel__unified_sink_detect",
+    "mcp__codescalpel__type_evaporation_scan",
+    "mcp__codescalpel__symbolic_execute",
+    "mcp__codescalpel__simulate_refactor",
+    "mcp__codescalpel__generate_unit_tests",
+    "mcp__codescalpel__validate_paths",
+    "mcp__codescalpel__code_policy_check",
+    "mcp__codescalpel__verify_policy_integrity",
+    "mcp__codescalpel__get_capabilities",
 )
 MUTATING_CODESCALPEL_MCP_TOOLS: tuple[str, ...] = (
     "mcp__codescalpel__rename_symbol",
     "mcp__codescalpel__update_symbol",
-    "mcp__codescalpel__delete_symbol",
-    "mcp__codescalpel__simulate_refactor",
 )
 _CONTEXT_ALIASES: dict[str, tuple[str, ...]] = {
     "audit": ("code", "security", "analyze", "read"),
@@ -496,21 +510,27 @@ def format_matched_skills_for_prompt(
             if canonical and canonical not in seen_mcp:
                 seen_mcp.add(canonical)
                 mcp_tools.append(canonical)
-        allowed_str = ", ".join(mcp_tools) if mcp_tools else "none"
+        # The provider CLI enforces the exact allowlist; the prompt names only a sample so the
+        # guardrail does not crowd skill guidance out of the budget.
+        if mcp_tools:
+            sample = ", ".join(mcp_tools[:3]) + (", ..." if len(mcp_tools) > 3 else "")
+            allowed_str = f"{len(mcp_tools)} read-only tools ({sample})"
+        else:
+            allowed_str = "none"
         blocked_str = ", ".join(
             tool.rsplit("__", 1)[-1] for tool in MUTATING_CODESCALPEL_MCP_TOOLS
         )
         guardrail = (
             "[READ-ONLY GUARDRAIL] You are a least-privilege read-only auditor. "
             "Use read/search tools only and never invoke mutating, write, or shell tools. "
-            f"Allowed read-only Code Scalpel MCP tools: {allowed_str}. "
+            f"Allowed Code Scalpel MCP: {allowed_str}. "
             f"Explicitly blocked mutating MCP tools: {blocked_str}."
         )
         if len(guardrail) + 120 > max_chars:
-            short_allowed = ", ".join(t.rsplit("__", 1)[-1] for t in mcp_tools) if mcp_tools else "none"
+            short_allowed = ", ".join(t.rsplit("__", 1)[-1] for t in mcp_tools[:3]) if mcp_tools else "none"
             guardrail = (
                 "[READ-ONLY GUARDRAIL] Read-only auditor. "
-                f"Allowed Code Scalpel MCP: {short_allowed}. "
+                f"Allowed Code Scalpel MCP incl.: {short_allowed}. "
                 f"Blocked: {blocked_str}."
             )
         sections.append(guardrail)

@@ -1,6 +1,7 @@
 """Subscription CLI runners, executed directly without a shell."""
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from dagger import mcp
 from dagger.schema import UsageEvent
 
 from .base import (
@@ -34,6 +36,14 @@ _METERED_ENV_KEYS = (
 )
 
 
+def _accepts_mcp_tools(method) -> bool:
+    try:
+        params = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    return "mcp_tools" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 class _CliRunner(BaseProvider):
     executable: str
     stripped_env: tuple[str, ...]
@@ -44,8 +54,16 @@ class _CliRunner(BaseProvider):
             raise ValueError("timeout must be positive")
         self.timeout = timeout
 
-    def arguments(self, container, prompt: str, output: Path | None) -> list[str]:
+    def arguments(
+        self, container, prompt: str, output: Path | None, mcp_tools: list[str] | None = None
+    ) -> list[str]:
         raise NotImplementedError
+
+    @staticmethod
+    def scoped_mcp(container, mcp_tools: list[str] | None) -> tuple[list[str], bool]:
+        """Bare Code Scalpel tool names allowed for this container, and whether it is read-only."""
+        read_only = mcp.is_read_only_tools(container.allowed_tools)
+        return mcp.scope_codescalpel_tools(mcp_tools or [], read_only), read_only
 
     def parse(self, stdout: str, output: Path | None) -> str:
         return stdout.strip()
@@ -63,13 +81,17 @@ class _CliRunner(BaseProvider):
         try:
             async with self.semaphore(container.max_concurrency):
                 output = None
+                mcp_tools = list(getattr(task, "allowed_mcp_tools", None) or [])
                 if self.executable == "codex":
                     with tempfile.NamedTemporaryFile(
                         dir=Path.cwd(), prefix=".dagger-codex-", suffix=".txt", delete=False
                     ) as temporary_output:
                         output = Path(temporary_output.name)
                 try:
-                    args = self.arguments(container, prompt, output)
+                    if _accepts_mcp_tools(self.arguments):
+                        args = self.arguments(container, prompt, output, mcp_tools=mcp_tools)
+                    else:  # subclasses written before per-run MCP scoping
+                        args = self.arguments(container, prompt, output)
                     env = os.environ.copy()
                     for key in _METERED_ENV_KEYS:
                         env.pop(key, None)
@@ -205,10 +227,21 @@ class ClaudeCliRunner(_CliRunner):
     executable = "claude"
     stripped_env = ("ANTHROPIC_API_KEY",)
 
-    def arguments(self, container, prompt, output):
+    def arguments(self, container, prompt, output, mcp_tools=None):
         args = ["claude", "-p", prompt, "--output-format", "json"]
-        if container.allowed_tools:
-            args += ["--allowedTools", ",".join(container.allowed_tools)]
+        suffixes, read_only = self.scoped_mcp(container, mcp_tools)
+        allowed = mcp.claude_builtin_tools(container.allowed_tools)
+        allowed += [mcp.CODESCALPEL_TOOL_PREFIX + s for s in suffixes]
+        if suffixes:
+            # Strict: the worker sees only DAGGER's Code Scalpel server, not the user's other MCP servers.
+            args += ["--mcp-config", mcp.claude_mcp_config(), "--strict-mcp-config"]
+        if allowed:
+            args += ["--allowedTools", ",".join(allowed)]
+        if read_only:
+            denied = mcp.claude_write_builtins()
+            if suffixes:
+                denied += [mcp.CODESCALPEL_TOOL_PREFIX + s for s in mcp.mutating_suffixes()]
+            args += ["--disallowedTools", ",".join(denied)]
         return args
 
     def parse(self, stdout, output):
@@ -219,8 +252,13 @@ class CodexCliRunner(_CliRunner):
     executable = "codex"
     stripped_env = ("OPENAI_API_KEY",)
 
-    def arguments(self, container, prompt, output):
-        return ["codex", "exec", "--sandbox", "workspace-write", "--output-last-message", str(output), prompt]
+    def arguments(self, container, prompt, output, mcp_tools=None):
+        suffixes, read_only = self.scoped_mcp(container, mcp_tools)
+        args = ["codex", "exec", "--sandbox", "read-only" if read_only else "workspace-write"]
+        if suffixes:
+            # Unverified locally (codex not installed): relies on `-c mcp_servers.<name>.enabled_tools`.
+            args += mcp.codex_config_overrides(suffixes)
+        return args + ["--output-last-message", str(output), prompt]
 
     def parse(self, stdout, output):
         try:
@@ -234,8 +272,18 @@ class GeminiCliRunner(_CliRunner):
     executable = "gemini"
     stripped_env = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
-    def arguments(self, container, prompt, output):
-        return ["gemini", "-p", prompt, "--output-format", "json"]
+    def arguments(self, container, prompt, output, mcp_tools=None):
+        args = ["gemini", "-p", prompt, "--output-format", "json"]
+        suffixes, read_only = self.scoped_mcp(container, mcp_tools)
+        # Gemini has no per-run MCP flag (and ignores non-root-owned system settings), so the
+        # server comes from a DAGGER extension linked once by scripts/setup_codescalpel_clis.sh.
+        # The read-only variant excludes the mutating tools at the Gemini level.
+        extension = mcp.gemini_extension_name(read_only)
+        if suffixes and mcp.gemini_extension_installed(extension):
+            args += ["-e", extension, "--allowed-mcp-server-names", mcp.CODESCALPEL_SERVER_NAME]
+        if read_only:
+            args += ["--approval-mode", "plan"]
+        return args
 
     def parse(self, stdout, output):
         return _json_result(stdout, "response")
@@ -245,10 +293,20 @@ class CopilotCliRunner(_CliRunner):
     executable = "copilot"
     stripped_env = ("GITHUB_TOKEN", "GH_TOKEN")
 
-    def arguments(self, container, prompt, output):
+    def arguments(self, container, prompt, output, mcp_tools=None):
         args = ["copilot", "-p", prompt, "--silent"]
-        if container.allowed_tools:
-            args += ["--allow-tool", ",".join(container.allowed_tools)]
+        suffixes, read_only = self.scoped_mcp(container, mcp_tools)
+        server = mcp.CODESCALPEL_SERVER_NAME
+        if suffixes:
+            args += ["--additional-mcp-config", mcp.copilot_mcp_config(suffixes)]
+        for permission in mcp.copilot_builtin_permissions(container.allowed_tools):
+            args += ["--allow-tool", permission]
+        for suffix in suffixes:
+            args += ["--allow-tool", f"{server}({suffix})"]
+        if read_only:
+            # Deny rules take precedence over allow rules in Copilot.
+            for denied in ("write", "shell", *(f"{server}({s})" for s in mcp.mutating_suffixes())):
+                args += ["--deny-tool", denied]
         if container.model:
             args += ["--model", container.model]
         return args
@@ -382,7 +440,7 @@ class AgyCliRunner(_CliRunner):
 
         return canonical_model, candidate_effort
 
-    def arguments(self, container, prompt, output):
+    def arguments(self, container, prompt, output, mcp_tools=None):
         effective_prompt = prompt
         if container.container_id == "agy_swarm_squad" or container.role == "swarm_squad":
             effective_prompt = (
@@ -390,7 +448,12 @@ class AgyCliRunner(_CliRunner):
                 + prompt
             )
         model_name, effort_val = self.normalize_model_and_effort(container.model)
-        return ["agy", "-p", effective_prompt, "--model", model_name, "--effort", effort_val]
+        args = ["agy", "-p", effective_prompt, "--model", model_name, "--effort", effort_val]
+        # agy has no per-run MCP or per-tool flags: Code Scalpel comes from the user-level
+        # `agy mcp add codescalpel ...` registration, and plan mode is the read-only enforcement.
+        if mcp.is_read_only_tools(container.allowed_tools):
+            args += ["--mode", "plan"]
+        return args
 
     def parse(self, stdout, output):
         return stdout.strip()

@@ -341,10 +341,13 @@ def test_read_only_mcp_tool_scoping_and_guardrail():
         matched, read_only=True, allowed_mcp_tools=allowed
     )
     assert "[READ-ONLY GUARDRAIL]" in prompt_text
-    for ro_tool in READ_ONLY_CODESCALPEL_MCP_TOOLS:
-        assert ro_tool in prompt_text
-    for mutating_name in ("rename_symbol", "update_symbol", "delete_symbol", "simulate_refactor"):
+    # The CLI enforces the full allowlist; the prompt names the count and a sample.
+    assert f"{len(READ_ONLY_CODESCALPEL_MCP_TOOLS)} read-only tools" in prompt_text
+    assert READ_ONLY_CODESCALPEL_MCP_TOOLS[0] in prompt_text
+    for mutating_name in ("rename_symbol", "update_symbol"):
         assert mutating_name in prompt_text
+    # simulate_refactor only analyses a proposed change, so it is read-only.
+    assert "mcp__codescalpel__simulate_refactor" in allowed
 
     rw_allowed = registry.resolve_allowed_mcp_tools(matched, read_only=False)
     for ro_tool in READ_ONLY_CODESCALPEL_MCP_TOOLS:

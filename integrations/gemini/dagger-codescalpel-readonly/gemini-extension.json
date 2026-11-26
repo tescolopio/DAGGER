@@ -1,0 +1,21 @@
+{
+  "name": "dagger-codescalpel-readonly",
+  "version": "1.0.0",
+  "description": "Code Scalpel MCP server for DAGGER workers (read-only)",
+  "mcpServers": {
+    "codescalpel": {
+      "command": "uvx",
+      "args": [
+        "--with",
+        "mcp==1.30.0",
+        "codescalpel@2.1.4",
+        "mcp"
+      ],
+      "trust": true,
+      "excludeTools": [
+        "rename_symbol",
+        "update_symbol"
+      ]
+    }
+  }
+}

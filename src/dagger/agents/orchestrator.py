@@ -13,10 +13,10 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from ..bus import EventBus, FileBus
 from ..graph import build_graph
+from ..mcp import WRITE_TOOLS as _WRITE_TOOLS, codescalpel_enabled, default_codescalpel_tools
 from ..providers import ProviderRateLimitError
 from ..schema import GraphEvent, KanbanTask, MilestoneTask, TaskEnvelope
 
-_WRITE_TOOLS = frozenset({"write", "edit", "patch", "shell", "bash"})
 _IGNORED_CONTEXT_DIRS = frozenset({
     ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
     ".pytest_cache", ".mypy_cache", ".ruff_cache", ".dagger", "dist", "build",
@@ -477,6 +477,11 @@ class Orchestrator:
         allowed_mcp_tools = skill_registry.resolve_allowed_mcp_tools(
             matched_skills, read_only=read_only
         )
+        if codescalpel_enabled():
+            # Code Scalpel is a baseline worker capability, not only when its skill happens to match.
+            for tool_name in default_codescalpel_tools(read_only):
+                if tool_name not in allowed_mcp_tools:
+                    allowed_mcp_tools.append(tool_name)
 
         await self._emit(state["run_id"], state["kanban_id"], "NODE_SPAWNED",
                          {"node": "orchestrator", "provider": container.provider, "model": container.model})
@@ -513,6 +518,13 @@ class Orchestrator:
                 matched_skills,
                 read_only=read_only,
                 allowed_mcp_tools=allowed_mcp_tools,
+            )
+        if allowed_mcp_tools:
+            prompt_payload["code_scalpel"] = (
+                "Code Scalpel MCP tools are available. Prefer them over reading whole files: "
+                "extract_code / get_file_context to read a symbol, get_symbol_references and "
+                "get_call_graph to trace usage, security_scan to check changes"
+                + ("." if read_only else ", update_symbol / rename_symbol for symbol-level edits.")
             )
         prompt = json.dumps(prompt_payload, ensure_ascii=False)
         envelope_id = str(uuid5(NAMESPACE_URL, json.dumps([state["run_id"], milestone.milestone_id])))

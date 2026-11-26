@@ -50,9 +50,9 @@ def test_registry():
 @pytest.mark.parametrize(
     ("runner", "expected", "stdout", "removed"),
     [
-        (ClaudeCliRunner, ["claude", "-p", "Be concise\n\nExplain", "--output-format", "json", "--allowedTools", "read,write"], '{"result":"answer"}', ["ANTHROPIC_API_KEY"]),
+        (ClaudeCliRunner, ["claude", "-p", "Be concise\n\nExplain", "--output-format", "json", "--allowedTools", "Read,Write"], '{"result":"answer"}', ["ANTHROPIC_API_KEY"]),
         (GeminiCliRunner, ["gemini", "-p", "Be concise\n\nExplain", "--output-format", "json"], '{"response":"answer"}', ["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
-        (CopilotCliRunner, ["copilot", "-p", "Be concise\n\nExplain", "--silent", "--allow-tool", "read,write", "--model", "model"], "answer", ["GITHUB_TOKEN", "GH_TOKEN"]),
+        (CopilotCliRunner, ["copilot", "-p", "Be concise\n\nExplain", "--silent", "--allow-tool", "write", "--model", "model"], "answer", ["GITHUB_TOKEN", "GH_TOKEN"]),
     ],
 )
 async def test_cli_commands_and_credentials(monkeypatch, agent, task, runner, expected, stdout, removed):
