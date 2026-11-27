@@ -8,7 +8,14 @@ from typing import Any
 import aiosqlite
 import yaml
 
-from .schema import AgentContainer, EndpointCapability, GraphEvent, KanbanTask, UsageEvent
+from .schema import (
+    AgentContainer,
+    AvailableModel,
+    EndpointCapability,
+    GraphEvent,
+    KanbanTask,
+    UsageEvent,
+)
 
 _DEFAULT_SEED = Path(__file__).resolve().parents[2] / "containers" / "seed_containers.yaml"
 
@@ -50,6 +57,12 @@ class DatabaseManager:
                         model_name TEXT NOT NULL,
                         data TEXT NOT NULL,
                         PRIMARY KEY(provider, model_name)
+                    );
+                    CREATE TABLE IF NOT EXISTS provider_models (
+                        provider_id TEXT NOT NULL,
+                        model_id TEXT NOT NULL,
+                        data TEXT NOT NULL,
+                        PRIMARY KEY(provider_id, model_id)
                     );
                     CREATE TABLE IF NOT EXISTS kanban_tasks (
                         task_id TEXT PRIMARY KEY NOT NULL,
@@ -212,6 +225,61 @@ class DatabaseManager:
         return bool(await self._write(
             "DELETE FROM endpoint_capabilities WHERE provider=? AND model_name=?", (provider, model_name)
         ))
+
+    async def replace_provider_models(
+        self, provider_id: str, models: list[AvailableModel]
+    ) -> None:
+        normalized_provider = provider_id.strip().lower()
+        if not normalized_provider:
+            raise ValueError("provider_id must not be empty")
+        validated: list[AvailableModel] = []
+        for item in models:
+            model = AvailableModel.model_validate(
+                item.model_dump() if isinstance(item, AvailableModel) else item
+            )
+            if model.provider_id != normalized_provider:
+                model = model.model_copy(update={"provider_id": normalized_provider})
+            validated.append(model)
+        connection = await self._get_connection()
+        async with self._lock:
+            try:
+                await connection.execute(
+                    "DELETE FROM provider_models WHERE provider_id=?",
+                    (normalized_provider,),
+                )
+                for model in validated:
+                    await connection.execute(
+                        """INSERT INTO provider_models (provider_id, model_id, data) VALUES (?, ?, ?)
+                           ON CONFLICT(provider_id, model_id) DO UPDATE SET data=excluded.data""",
+                        (normalized_provider, model.model_id, model.model_dump_json()),
+                    )
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
+
+    async def list_provider_models(
+        self,
+        provider_id: str | None = None,
+        *,
+        available_only: bool = False,
+        llm_only: bool = False,
+    ) -> list[AvailableModel]:
+        if provider_id is not None:
+            rows = await self._read(
+                "SELECT data FROM provider_models WHERE provider_id=? ORDER BY provider_id, model_id",
+                (provider_id.strip().lower(),),
+            )
+        else:
+            rows = await self._read(
+                "SELECT data FROM provider_models ORDER BY provider_id, model_id"
+            )
+        results = [AvailableModel.model_validate_json(row[0]) for row in rows]
+        if available_only:
+            results = [item for item in results if item.available]
+        if llm_only:
+            results = [item for item in results if item.is_llm]
+        return results
 
     async def upsert_task(self, task: KanbanTask) -> KanbanTask:
         task = KanbanTask.model_validate(

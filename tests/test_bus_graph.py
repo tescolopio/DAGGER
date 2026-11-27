@@ -312,7 +312,8 @@ def test_agy_cli_runner_arguments_and_parse():
     runner = AgyCliRunner()
     container = AgentContainer(name="fast_auditor_agy", role="fast_auditor", provider="agy", model="gemini-4-hydrogen")
     args = runner.arguments(container, "audit this", None)
-    assert args == ["agy", "-p", "audit this", "--model", "Gemini 4 Hydrogen", "--effort", "low"]
+    assert args == ["agy", "-p", "audit this", "--model", "gemini-4-hydrogen-low", "--disable-slash-commands"]
+    assert "--effort" not in args
     assert runner.parse("  ok  ", None) == "ok"
 
 
@@ -506,7 +507,7 @@ async def test_api_get_task_logs_replay_and_404(tmp_path):
     from dagger.server import create_app
     from dagger.schema import KanbanTask
 
-    app = create_app(db_path=tmp_path / "api.db")
+    app = create_app(db_path=tmp_path / "api.db", container_dir=tmp_path / "containers")
     with TestClient(app) as client:
         assert client.get("/api/tasks/missing/logs").status_code == 404
 

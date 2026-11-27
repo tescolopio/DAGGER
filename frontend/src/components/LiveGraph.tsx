@@ -17,7 +17,7 @@ const SYSTEM_CONTROL_NODES = new Set([
   'start',
 ]);
 
-const PROVIDER_ORDER = ['claude', 'codex', 'gemini', 'copilot', 'agy', 'groq', 'local', 'system'] as const;
+const PROVIDER_ORDER = ['claude', 'codex', 'gemini', 'copilot', 'agy', 'groq', 'api', 'local', 'system'] as const;
 type ProviderKey = (typeof PROVIDER_ORDER)[number];
 
 const DEFAULT_PROVIDER_COLORS: Record<ProviderKey, string> = {
@@ -27,6 +27,7 @@ const DEFAULT_PROVIDER_COLORS: Record<ProviderKey, string> = {
   copilot: '#8b5cf6',
   agy: '#ec4899',
   groq: '#f59e0b',
+  api: '#38bdf8',
   local: '#14b8a6',
   system: '#8291a3',
 };
@@ -37,7 +38,8 @@ const PROVIDER_LABELS: Record<ProviderKey, string> = {
   gemini: 'Gemini',
   copilot: 'Copilot',
   agy: 'AGY',
-  groq: 'Groq/API',
+  groq: 'Groq',
+  api: 'Custom API',
   local: 'Local',
   system: 'System',
 };
@@ -54,9 +56,18 @@ function normalizeProvider(raw?: string | null, containerId?: string | null, nod
     if (val.includes('local') || val.includes('ollama') || val.includes('lmstudio')) return 'local';
   }
   for (const val of candidates) {
-    if (val === 'api' || val.startsWith('api_')) return 'groq';
+    if (val === 'api' || val.startsWith('api_') || val.includes('custom_api') || val.includes('openrouter')) {
+      return 'api';
+    }
   }
   return 'system';
+}
+
+function formatProviderLabel(provider: ProviderKey, rawProviderLabel?: string): string {
+  if (provider === 'system' && rawProviderLabel && rawProviderLabel.toLowerCase() !== 'system') {
+    return rawProviderLabel;
+  }
+  return PROVIDER_LABELS[provider];
 }
 
 function loadSavedColors(): Record<ProviderKey, string> {
@@ -74,6 +85,7 @@ type FlowData = {
   label: string;
   detail: string;
   provider: ProviderKey;
+  rawProviderLabel?: string;
   model?: string;
   color: string;
   skills?: string[];
@@ -125,8 +137,8 @@ function AgentNode({ data }: NodeProps<FlowNode>) {
         <div className="flow-top-row">
           <div className="flow-label">{data.label}</div>
           <span className="flow-provider-pill" style={pillStyle}>
-            {PROVIDER_LABELS[data.provider]}
-            {data.provider !== 'system' && data.model ? ` · ${data.model}` : ''}
+            {formatProviderLabel(data.provider, data.rawProviderLabel)}
+            {(data.provider !== 'system' || data.rawProviderLabel) && data.model ? ` · ${data.model}` : ''}
           </span>
         </div>
         <div className="flow-detail">{data.detail}</div>
@@ -247,7 +259,11 @@ export default function LiveGraph({
         : inferred !== 'system'
           ? inferred
           : current?.data.provider ?? 'system';
-      const model = provider !== 'system' ? metaModel || current?.data.model : undefined;
+      const rawProviderLabel = isControlGate
+        ? undefined
+        : (rawProvider && rawProvider.toLowerCase() !== 'system' ? rawProvider : current?.data.rawProviderLabel);
+      const model =
+        provider !== 'system' || rawProviderLabel ? metaModel || current?.data.model : undefined;
       const color = providerColors[provider] || DEFAULT_PROVIDER_COLORS[provider];
       const isWorker =
         isWorkerNodeId(id) ||
@@ -272,10 +288,11 @@ export default function LiveGraph({
                 : id
               : current?.data.label || id,
           detail:
-            (isTarget ? metaModel || event.container_id || (provider !== 'system' ? event.provider : undefined) : undefined) ||
+            (isTarget ? metaModel || event.container_id || (provider !== 'system' ? event.provider : rawProviderLabel) : undefined) ||
             current?.data.detail ||
-            (provider === 'system' ? 'Control gate' : 'Agent'),
+            (provider === 'system' && !rawProviderLabel ? 'Control gate' : 'Agent'),
           provider,
+          rawProviderLabel,
           model,
           color,
           skills,
@@ -325,9 +342,11 @@ export default function LiveGraph({
     .map(parseSwarmPost);
   const selectedNode = selected ? nodes.find(node => node.id === selected) : undefined;
   const selectedProvider: ProviderKey = selectedNode?.data.provider ?? 'system';
+  const selectedRawProviderLabel = selectedNode?.data.rawProviderLabel;
   const selectedColor =
     selectedNode?.data.color ?? providerColors[selectedProvider] ?? DEFAULT_PROVIDER_COLORS.system;
-  const selectedModel = selectedProvider !== 'system' ? selectedNode?.data.model : undefined;
+  const selectedModel =
+    selectedProvider !== 'system' || selectedRawProviderLabel ? selectedNode?.data.model : undefined;
 
   return (
     <div className="graph-wrapper">
@@ -424,7 +443,7 @@ export default function LiveGraph({
                   background: `${selectedColor}1a`,
                 }}
               >
-                {PROVIDER_LABELS[selectedProvider]}
+                {formatProviderLabel(selectedProvider, selectedRawProviderLabel)}
                 {selectedModel ? ` · ${selectedModel}` : ''}
               </span>
             </div>

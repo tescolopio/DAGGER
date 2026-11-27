@@ -70,8 +70,12 @@ function App() {
       setSkills(results[6].value.skills ?? []);
       setSkillSources(results[6].value.sources ?? {});
     }
-    if (results.slice(0, 3).some(result => result.status === 'rejected')) {
-      setError('Unable to reach the DAGGER API. Check that the backend is running.');
+    const coreFailed = results.slice(0, 4).some(result => result.status === 'rejected');
+    const secondaryFailed = results.slice(4).some(result => result.status === 'rejected');
+    if (coreFailed) {
+      setError('Unable to reach the DAGGER API or load provider status. Check that the backend is running.');
+    } else if (secondaryFailed) {
+      setError('Some registry data (usage, rolodex, or skills) could not be loaded.');
     }
   }, []);
 
@@ -224,7 +228,8 @@ function App() {
             rolodex={rolodex}
             skills={skills}
             skillSources={skillSources}
-            onRefresh={() => void act(api.refreshRegistry)}
+            onReload={refresh}
+            onRefreshRegistry={() => act(api.refreshRegistry)}
           />
         )}
       </div></main>

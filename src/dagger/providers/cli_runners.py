@@ -33,6 +33,10 @@ _METERED_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
+    "COPILOT_GITHUB_TOKEN",
+    "COPILOT_PROVIDER_API_KEY",
+    "COPILOT_PROVIDER_BEARER_TOKEN",
+    "COPILOT_PROVIDER_BASE_URL",
 )
 
 
@@ -332,50 +336,129 @@ class AgyCliRunner(_CliRunner):
     executable = "agy"
     stripped_env = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
-    SUPPORTED_MODELS: tuple[str, ...] = (
-        "Gemini 4 Neon",
-        "Gemini 4 Carbon",
-        "Gemini 4 Argon",
-        "Gemini 4 Hydrogen",
-        "Orchestrator",
-        "Gemini 3.8 Flash",
-        "Claude Opus 5.5",
-        "Claude Sonnet 5.5",
-        "GPT-OSS 120B",
+    # Exact (slug, display_label) catalog returned by `agy models` (v1.5.18).
+    # Every model bakes its reasoning tier into the model ID itself; passing
+    # `--effort` causes `agy` to fail closed with `--effort is not supported`.
+    SUPPORTED_MODEL_SPECS: tuple[tuple[str, str], ...] = (
+        ("gemini-4-neon-high", "Gemini 4 Neon (High)"),
+        ("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"),
+        ("gemini-4-neon-medium", "Gemini 4 Neon (Medium)"),
+        ("gemini-4-neon-low", "Gemini 4 Neon (Low)"),
+        ("gemini-4-carbon-medium", "Gemini 4 Carbon (Medium)"),
+        ("gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
+        ("gemini-4-carbon-low", "Gemini 4 Carbon (Low)"),
+        ("gemini-4-argon-medium", "Gemini 4 Argon (Medium)"),
+        ("gemini-4-argon-high", "Gemini 4 Argon (High)"),
+        ("gemini-4-argon-low", "Gemini 4 Argon (Low)"),
+        ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
+        ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"),
+        ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
+        ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)"),
+        ("gemini-pro-orchestrator-neon", "Orchestrator (Neon)"),
+        ("gemini-pro-orchestrator", "Orchestrator (Carbon)"),
+        ("gemini-pro-orchestrator-argon", "Orchestrator (Argon)"),
+        ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
+        ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"),
+        ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"),
+        ("claude-opus-5-5-low", "Claude Opus 5.5 (Low)"),
+        ("claude-opus-5-5-medium", "Claude Opus 5.5 (Medium)"),
+        ("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),
+        ("claude-sonnet-5-5-low", "Claude Sonnet 5.5 (Low)"),
+        ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)"),
+        ("claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)"),
+        ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
     )
-    SUPPORTED_EFFORTS: tuple[str, ...] = (
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "neon",
-        "carbon",
-        "argon",
-    )
-    _DEFAULT_EFFORT_BY_MODEL: dict[str, str] = {
-        "Gemini 4 Neon": "high",
-        "Gemini 4 Carbon": "medium",
-        "Gemini 4 Argon": "medium",
-        "Gemini 4 Hydrogen": "low",
-        "Orchestrator": "neon",
-        "Gemini 3.8 Flash": "low",
-        "Claude Opus 5.5": "high",
-        "Claude Sonnet 5.5": "medium",
-        "GPT-OSS 120B": "medium",
+    SUPPORTED_MODELS: tuple[str, ...] = tuple(slug for slug, _ in SUPPORTED_MODEL_SPECS)
+    SUPPORTED_LABELS: tuple[str, ...] = tuple(label for _, label in SUPPORTED_MODEL_SPECS)
+    _SLUG_MAP: dict[str, str] = {
+        **{slug.lower(): slug for slug, _ in SUPPORTED_MODEL_SPECS},
+        # Punctuation aliases (e.g. `gemini-3-8-flash-low`, `claude-opus-5.5-high`).
+        "gemini-3-8-flash-high": "gemini-3.8-flash-high",
+        "gemini-3-8-flash-medium": "gemini-3.8-flash-medium",
+        "gemini-3-8-flash-low": "gemini-3.8-flash-low",
+        "claude-opus-5.5-low": "claude-opus-5-5-low",
+        "claude-opus-5.5-medium": "claude-opus-5-5-medium",
+        "claude-opus-5.5-high": "claude-opus-5-5-high",
+        "claude-sonnet-5.5-low": "claude-sonnet-5-5-low",
+        "claude-sonnet-5.5-medium": "claude-sonnet-5-5-medium",
+        "claude-sonnet-5.5-high": "claude-sonnet-5-5-high",
+        "orchestrator-neon": "gemini-pro-orchestrator-neon",
+        "orchestrator-carbon": "gemini-pro-orchestrator",
+        "orchestrator-argon": "gemini-pro-orchestrator-argon",
+        "gemini-pro-orchestrator-carbon": "gemini-pro-orchestrator",
     }
-    _SLUG_TO_MODEL: dict[str, str] = {
-        "gemini-4-neon": "Gemini 4 Neon",
-        "gemini-4-carbon": "Gemini 4 Carbon",
-        "gemini-4-argon": "Gemini 4 Argon",
-        "gemini-4-hydrogen": "Gemini 4 Hydrogen",
-        "orchestrator": "Orchestrator",
-        "gemini-3.8-flash": "Gemini 3.8 Flash",
-        "gemini-3-8-flash": "Gemini 3.8 Flash",
-        "claude-opus-5-5": "Claude Opus 5.5",
-        "claude-opus-5.5": "Claude Opus 5.5",
-        "claude-sonnet-5-5": "Claude Sonnet 5.5",
-        "claude-sonnet-5.5": "Claude Sonnet 5.5",
-        "gpt-oss-120b": "GPT-OSS 120B",
+    _LABEL_TO_SLUG: dict[str, str] = {label.lower(): slug for slug, label in SUPPORTED_MODEL_SPECS}
+    _FAMILY_TIERS: dict[str, dict[str, str]] = {
+        "gemini-4-neon": {
+            "high": "gemini-4-neon-high",
+            "xhigh": "gemini-4-neon-xhigh",
+            "medium": "gemini-4-neon-medium",
+            "low": "gemini-4-neon-low",
+        },
+        "gemini-4-carbon": {
+            "medium": "gemini-4-carbon-medium",
+            "high": "gemini-4-carbon-high",
+            "low": "gemini-4-carbon-low",
+        },
+        "gemini-4-argon": {
+            "medium": "gemini-4-argon-medium",
+            "high": "gemini-4-argon-high",
+            "low": "gemini-4-argon-low",
+        },
+        "gemini-4-hydrogen": {
+            "high": "gemini-4-hydrogen-high",
+            "xhigh": "gemini-4-hydrogen-xhigh",
+            "medium": "gemini-4-hydrogen-medium",
+            "low": "gemini-4-hydrogen-low",
+        },
+        "orchestrator": {
+            "neon": "gemini-pro-orchestrator-neon",
+            "carbon": "gemini-pro-orchestrator",
+            "argon": "gemini-pro-orchestrator-argon",
+        },
+        "gemini-3.8-flash": {
+            "high": "gemini-3.8-flash-high",
+            "medium": "gemini-3.8-flash-medium",
+            "low": "gemini-3.8-flash-low",
+        },
+        "claude-opus-5-5": {
+            "low": "claude-opus-5-5-low",
+            "medium": "claude-opus-5-5-medium",
+            "high": "claude-opus-5-5-high",
+        },
+        "claude-sonnet-5-5": {
+            "low": "claude-sonnet-5-5-low",
+            "medium": "claude-sonnet-5-5-medium",
+            "high": "claude-sonnet-5-5-high",
+        },
+        "gpt-oss-120b": {
+            "medium": "gpt-oss-120b-medium",
+        },
+    }
+    _DEFAULT_TIER_BY_FAMILY: dict[str, str] = {
+        "gemini-4-neon": "high",
+        "gemini-4-carbon": "medium",
+        "gemini-4-argon": "medium",
+        "gemini-4-hydrogen": "low",
+        "orchestrator": "neon",
+        "gemini-3.8-flash": "low",
+        "claude-opus-5-5": "high",
+        "claude-sonnet-5-5": "medium",
+        "gpt-oss-120b": "medium",
+    }
+    _FAMILY_ALIASES: dict[str, str] = {
+        "gemini-4-neon": "gemini-4-neon",
+        "gemini-4-carbon": "gemini-4-carbon",
+        "gemini-4-argon": "gemini-4-argon",
+        "gemini-4-hydrogen": "gemini-4-hydrogen",
+        "orchestrator": "orchestrator",
+        "gemini-3.8-flash": "gemini-3.8-flash",
+        "gemini-3-8-flash": "gemini-3.8-flash",
+        "claude-opus-5-5": "claude-opus-5-5",
+        "claude-opus-5.5": "claude-opus-5-5",
+        "claude-sonnet-5-5": "claude-sonnet-5-5",
+        "claude-sonnet-5.5": "claude-sonnet-5-5",
+        "gpt-oss-120b": "gpt-oss-120b",
     }
     _FAST_TIER_KEYWORDS: tuple[str, ...] = (
         "haiku",
@@ -389,66 +472,94 @@ class AgyCliRunner(_CliRunner):
     )
 
     @classmethod
-    def normalize_model_and_effort(
-        cls, model: str | None, effort: str | None = None
-    ) -> tuple[str, str]:
-        """Normalize any model/effort string into exact supported `agy` CLI flags."""
+    def normalize_model(cls, model: str | None, effort: str | None = None) -> str:
+        """Normalize any model/tier string into an exact valid `agy models` slug."""
         raw_model = (model or "").strip()
-        parsed_effort: str | None = None
+        explicit_tier = (effort or "").strip().lower() or None
 
-        if raw_model.endswith(")") and "(" in raw_model:
-            base, _, paren = raw_model[:-1].rpartition("(")
+        # Exact display label or slug match when no overriding effort was requested.
+        if raw_model and explicit_tier is None:
+            lowered_raw = raw_model.lower()
+            if lowered_raw in cls._LABEL_TO_SLUG:
+                return cls._LABEL_TO_SLUG[lowered_raw]
+            direct_slug = lowered_raw.replace("_", "-").replace(" ", "-")
+            if direct_slug in cls._SLUG_MAP:
+                return cls._SLUG_MAP[direct_slug]
+
+        parsed_tier: str | None = None
+        base_text = raw_model
+        if base_text.endswith(")") and "(" in base_text:
+            base, _, paren = base_text[:-1].rpartition("(")
             if base.strip():
-                raw_model = base.strip()
-                parsed_effort = paren.strip().lower()
+                base_text = base.strip()
+                parsed_tier = paren.strip().lower() or None
 
-        canonical_model: str | None = None
-        for supported in cls.SUPPORTED_MODELS:
-            if raw_model.lower() == supported.lower():
-                canonical_model = supported
-                break
+        slug = base_text.lower().replace("_", "-").replace(" ", "-")
+        # If slug already names a specific catalog entry, resolve its family and tier
+        # so an explicit `effort` override can still select a sibling tier cleanly.
+        if slug in cls._SLUG_MAP:
+            resolved_slug = cls._SLUG_MAP[slug]
+            for family, tiers in cls._FAMILY_TIERS.items():
+                for tier_name, tier_slug in tiers.items():
+                    if tier_slug == resolved_slug:
+                        chosen = explicit_tier or parsed_tier or tier_name
+                        if chosen in tiers:
+                            return tiers[chosen]
+                        return resolved_slug
 
-        if canonical_model is None and raw_model:
-            slug = raw_model.lower().replace("_", "-").replace(" ", "-")
-            if slug in cls._SLUG_TO_MODEL:
-                canonical_model = cls._SLUG_TO_MODEL[slug]
-            else:
-                for eff in cls.SUPPORTED_EFFORTS:
-                    suffix = f"-{eff}"
-                    if slug.endswith(suffix):
-                        base_slug = slug[: -len(suffix)]
-                        if base_slug in cls._SLUG_TO_MODEL:
-                            canonical_model = cls._SLUG_TO_MODEL[base_slug]
-                            if parsed_effort is None:
-                                parsed_effort = eff
+        family = cls._FAMILY_ALIASES.get(slug)
+        if family is None and slug:
+            for candidate_family, tiers in cls._FAMILY_TIERS.items():
+                for alias, mapped in cls._FAMILY_ALIASES.items():
+                    if mapped != candidate_family:
+                        continue
+                    for tier_name in tiers:
+                        if slug == f"{alias}-{tier_name}":
+                            family = candidate_family
+                            if parsed_tier is None:
+                                parsed_tier = tier_name
                             break
+                    if family is not None:
+                        break
+                if family is not None:
+                    break
 
-        if canonical_model is None:
+        if family is None:
             lowered = raw_model.lower()
             if any(kw in lowered for kw in cls._FAST_TIER_KEYWORDS):
-                canonical_model = "Gemini 4 Hydrogen"
-                if parsed_effort is None:
-                    parsed_effort = "low"
+                family = "gemini-4-hydrogen"
             else:
-                canonical_model = "Gemini 4 Neon"
-                if parsed_effort is None:
-                    parsed_effort = "high"
+                family = "gemini-4-neon"
 
-        candidate_effort = (effort or parsed_effort or "").strip().lower()
-        if candidate_effort not in cls.SUPPORTED_EFFORTS:
-            candidate_effort = cls._DEFAULT_EFFORT_BY_MODEL.get(canonical_model, "high")
+        tiers = cls._FAMILY_TIERS[family]
+        candidate_tier = explicit_tier or parsed_tier or cls._DEFAULT_TIER_BY_FAMILY[family]
+        if candidate_tier in tiers:
+            return tiers[candidate_tier]
+        return tiers[cls._DEFAULT_TIER_BY_FAMILY[family]]
 
-        return canonical_model, candidate_effort
+    @classmethod
+    def normalize_model_and_effort(
+        cls, model: str | None, effort: str | None = None
+    ) -> tuple[str, None]:
+        """Return `(canonical_agy_model_slug, None)`.
+
+        `agy` v1.5.18 encodes reasoning effort inside each model identifier and
+        rejects `--effort` for all catalog models, so effort is always `None`.
+        """
+        return cls.normalize_model(model, effort=effort), None
 
     def arguments(self, container, prompt, output, mcp_tools=None):
+        is_swarm = container.container_id == "agy_swarm_squad" or container.role == "swarm_squad"
         effective_prompt = prompt
-        if container.container_id == "agy_swarm_squad" or container.role == "swarm_squad":
+        if is_swarm:
             effective_prompt = (
                 "/swarm Execute non-interactively and strictly stay within allowed_write_paths.\n"
                 + prompt
             )
-        model_name, effort_val = self.normalize_model_and_effort(container.model)
-        args = ["agy", "-p", effective_prompt, "--model", model_name, "--effort", effort_val]
+        model_id = self.normalize_model(container.model)
+        args = ["agy", "-p", effective_prompt, "--model", model_id]
+        if not is_swarm:
+            args += ["--disable-slash-commands"]
         # agy has no per-run MCP or per-tool flags: Code Scalpel comes from the user-level
         # `agy mcp add codescalpel ...` registration, and plan mode is the read-only enforcement.
         if mcp.is_read_only_tools(container.allowed_tools):

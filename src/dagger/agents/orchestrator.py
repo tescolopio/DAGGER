@@ -255,8 +255,20 @@ class Orchestrator:
                         plan = await self.project_manager.decompose_goal(task)
             else:
                 plan = await self.project_manager.decompose_goal(task)
+        except Exception as exc:
+            err_provider = getattr(self.project_manager, "provider", None) or pm_provider
+            await self._emit_card_log(
+                kanban_id=task.task_id,
+                run_id=effective_run_id,
+                node_id="pm_plan_node",
+                provider=err_provider,
+                channel="stderr",
+                text=f"PM planning failed: {exc}",
+            )
+            raise
         finally:
             card_log_hook.reset(token)
+        pm_provider = getattr(self.project_manager, "provider", None) or pm_provider
         await self._update_task(task.task_id, status="Running", milestones=list(plan.milestones))
         await self._emit_card_log(
             kanban_id=task.task_id,
@@ -277,14 +289,72 @@ class Orchestrator:
         return {"milestones": [m.model_dump(mode="json") for m in plan.milestones],
                 "dependencies": {key: list(value) for key, value in plan.dependencies.items()}}
 
+    @staticmethod
+    def _is_llm_container(container, capabilities: list[Any]) -> bool:
+        from .generator import infer_service_provider
+
+        sp = infer_service_provider(container)
+        if sp == "tavily" or (container.model or "").strip().lower() == "tavily-search":
+            return False
+        matches = [
+            cap for cap in capabilities
+            if cap.provider == container.provider
+            and (getattr(cap, "service_provider", None) is None or cap.service_provider == sp)
+            and (not container.model or cap.model_name == container.model)
+        ]
+        if matches and all(getattr(cap, "is_llm", True) is False for cap in matches):
+            return False
+        return True
+
+    @classmethod
+    def _is_container_model_eligible(
+        cls,
+        container,
+        capabilities: list[Any],
+        provider_models_by_provider: dict[str, list[Any]],
+    ) -> bool:
+        from .generator import infer_service_provider, match_available_model
+
+        if not cls._is_llm_container(container, capabilities):
+            return False
+        sp = infer_service_provider(container)
+        discovered = provider_models_by_provider.get(sp)
+        if discovered:
+            avail_llms = [m for m in discovered if m.available and m.is_llm]
+            if container.model:
+                return match_available_model(sp, container.model, avail_llms) is not None
+            return bool(avail_llms)
+        if capabilities:
+            matches = [
+                cap for cap in capabilities
+                if cap.provider == container.provider
+                and (getattr(cap, "service_provider", None) is None or cap.service_provider == sp)
+                and (not container.model or cap.model_name == container.model)
+            ]
+            if matches:
+                return any(
+                    cap.healthy and getattr(cap, "available", True) and getattr(cap, "is_llm", True)
+                    for cap in matches
+                )
+        return True
+
+    async def _load_provider_models_by_provider(self) -> dict[str, list[Any]]:
+        if not hasattr(self.db, "list_provider_models"):
+            return {}
+        models = await self.db.list_provider_models()
+        grouped: dict[str, list[Any]] = {}
+        for item in models:
+            grouped.setdefault(item.provider_id, []).append(item)
+        return grouped
+
     async def select(self, milestone: MilestoneTask):
         containers = [container for container in await self.db.list_containers() if container.active]
         capabilities = await self.db.list_capabilities()
-        if capabilities:
-            containers = [c for c in containers if not (
-                matches := [cap for cap in capabilities if cap.provider == c.provider
-                            and (not c.model or cap.model_name == c.model)]
-            ) or any(cap.healthy for cap in matches)]
+        provider_models = await self._load_provider_models_by_provider()
+        containers = [
+            c for c in containers
+            if self._is_container_model_eligible(c, capabilities, provider_models)
+        ]
         if milestone.assigned_container_id:
             containers = [c for c in containers if c.container_id == milestone.assigned_container_id]
         if not containers:
@@ -581,6 +651,7 @@ class Orchestrator:
         candidates = [container]
         available = await self.db.list_containers()
         capabilities = await self.db.list_capabilities()
+        provider_models = await self._load_provider_models_by_provider()
         seen_ids = {container.container_id}
         for name in container.fallback_providers:
             # A fallback uses its own explicit credentials, model and cost tier.
@@ -589,19 +660,18 @@ class Orchestrator:
                     c.active
                     and (c.container_id == name or c.provider == name)
                     and c.container_id not in seen_ids
-                    and (not (matches := [cap for cap in capabilities if cap.provider == c.provider
-                                          and (not c.model or cap.model_name == c.model)])
-                         or any(cap.healthy for cap in matches))
+                    and self._is_container_model_eligible(c, capabilities, provider_models)
                 ):
                     candidates.append(c)
                     seen_ids.add(c.container_id)
         for c in available:
-            if c.active and c.container_id not in seen_ids:
-                matches = [cap for cap in capabilities if cap.provider == c.provider
-                           and (not c.model or cap.model_name == c.model)]
-                if not matches or any(cap.healthy for cap in matches):
-                    candidates.append(c)
-                    seen_ids.add(c.container_id)
+            if (
+                c.active
+                and c.container_id not in seen_ids
+                and self._is_container_model_eligible(c, capabilities, provider_models)
+            ):
+                candidates.append(c)
+                seen_ids.add(c.container_id)
         last_error = None
         for index, candidate in enumerate(candidates):
             if index:

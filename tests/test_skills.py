@@ -176,7 +176,11 @@ def test_api_skills_endpoint(tmp_path: Path, monkeypatch):
     # Pin the project: pytest's tmp dir sits inside the DAGGER repo, whose git root would win.
     monkeypatch.setenv("DAGGER_PROJECT", str(tmp_path))
     monkeypatch.chdir(tmp_path)
-    app = create_app(db_path=tmp_path / "dagger.sqlite3", checkpoint_path=tmp_path / "cp.sqlite3")
+    app = create_app(
+        db_path=tmp_path / "dagger.sqlite3",
+        checkpoint_path=tmp_path / "cp.sqlite3",
+        container_dir=tmp_path / "containers",
+    )
     with TestClient(app) as client:
         resp = client.get("/api/skills")
         assert resp.status_code == 200
@@ -194,7 +198,11 @@ def test_api_skills_endpoint(tmp_path: Path, monkeypatch):
 
 
 def test_api_skills_real_repo_workspace(tmp_path: Path):
-    app = create_app(db_path=tmp_path / "dagger.sqlite3", checkpoint_path=tmp_path / "cp.sqlite3")
+    app = create_app(
+        db_path=tmp_path / "dagger.sqlite3",
+        checkpoint_path=tmp_path / "cp.sqlite3",
+        container_dir=tmp_path / "containers",
+    )
     with TestClient(app) as client:
         resp = client.get("/api/skills")
         assert resp.status_code == 200

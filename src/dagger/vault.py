@@ -5,20 +5,61 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 _PROVIDER_KEY_MAP = {
     "groq": "GROQ_API_KEY",
     "tavily": "TAVILY_API_KEY",
     "api": "DAGGER_API_KEY",
+    "local": "DAGGER_LOCAL_API_KEY",
 }
 
+_PROVIDER_BASE_URL_MAP = {
+    "api": "DAGGER_API_BASE_URL",
+    "local": "DAGGER_LOCAL_BASE_URL",
+}
 
 _IMPORTABLE_KEYS = (
     "GROQ_API_KEY",
     "TAVILY_API_KEY",
     "DAGGER_API_KEY",
     "DAGGER_API_BASE_URL",
+    "DAGGER_LOCAL_API_KEY",
+    "DAGGER_LOCAL_BASE_URL",
 )
+
+
+def validate_base_url(url: str) -> str:
+    """Validate and normalize an HTTP(S) base URL without embedded credentials."""
+    if not isinstance(url, str) or "\r" in url or "\n" in url:
+        raise ValueError("base_url must be single-line")
+    cleaned = url.strip()
+    if not cleaned:
+        raise ValueError("base_url must not be empty")
+    try:
+        parsed = urlsplit(cleaned)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("base_url must be a valid HTTP(S) URL without embedded credentials") from None
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not (1 <= port <= 65535))
+    ):
+        raise ValueError("base_url must be a valid HTTP(S) URL without embedded credentials")
+    return cleaned
+
+
+def get_base_url(provider_id: str) -> str | None:
+    """Return configured base URL for a provider from vault or environment."""
+    env_key = _PROVIDER_BASE_URL_MAP.get(provider_id.strip().lower())
+    if env_key is None:
+        return None
+    return get_vault_credential(env_key)
 
 
 def _get_repo_root() -> Path:
@@ -108,26 +149,35 @@ def get_vault_credential(key: str) -> str | None:
 
 
 def save_provider_credentials(
-    provider: str, api_key: str, base_url: str | None = None
+    provider: str, api_key: str = "", base_url: str | None = None
 ) -> Path:
     provider_id = provider.strip().lower()
     env_key = _PROVIDER_KEY_MAP.get(provider_id)
     if env_key is None:
         raise ValueError(f"Unsupported credential provider: {provider}")
-    cleaned_key = api_key.strip()
-    if not cleaned_key or "\r" in api_key or "\n" in api_key:
+    if "\r" in api_key or "\n" in api_key:
         raise ValueError("api_key must be non-empty and single-line")
+    cleaned_key = api_key.strip()
+    if provider_id != "local" and not cleaned_key:
+        raise ValueError("api_key must be non-empty and single-line")
+    if provider_id == "local" and base_url is None and not cleaned_key:
+        raise ValueError("base_url is required for local provider")
 
     creds = load_vault_credentials()
-    creds[env_key] = cleaned_key
-    if provider_id == "api" and base_url is not None:
+    if cleaned_key:
+        creds[env_key] = cleaned_key
+    elif provider_id == "local":
+        creds.pop(env_key, None)
+
+    url_env_key = _PROVIDER_BASE_URL_MAP.get(provider_id)
+    if url_env_key is not None and base_url is not None:
         if "\r" in base_url or "\n" in base_url:
             raise ValueError("base_url must be single-line")
         cleaned_url = base_url.strip()
         if cleaned_url:
-            creds["DAGGER_API_BASE_URL"] = cleaned_url
+            creds[url_env_key] = validate_base_url(cleaned_url)
         else:
-            creds.pop("DAGGER_API_BASE_URL", None)
+            creds.pop(url_env_key, None)
 
     path = get_vault_path()
     _write_vault_file(path, creds)

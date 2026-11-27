@@ -32,19 +32,30 @@ from dagger.bus import EventBus
 from dagger.db import DatabaseManager
 from dagger.schema import (
     AgentContainer,
+    AvailableModel,
     DefinitionOfDone,
     KanbanTask,
     ProviderCredentialStatus,
     TaskEnvelope,
 )
-from dagger.providers import ProviderRegistry
-from dagger.vault import get_vault_credential, save_provider_credentials
+from dagger.providers import ProviderError, ProviderRegistry
+from dagger.providers.cli_runners import AgyCliRunner
+from dagger.providers.discovery import (
+    CLI_PROBE_STRIPPED_ENV,
+    SERVICE_PROVIDER_BY_ID,
+    SERVICE_PROVIDER_METADATA,
+    DiscoveryResult,
+    discover_provider_models,
+    has_copilot_local_auth,
+    has_gemini_subscription_auth,
+)
+from dagger.vault import get_base_url, get_vault_credential, save_provider_credentials
 
 logger = logging.getLogger(__name__)
 
 
 class LoginCompleteRequest(BaseModel):
-    input: str
+    input: str = ""
 
 
 def _trusted_websocket_origin(websocket: WebSocket) -> bool:
@@ -78,13 +89,180 @@ class ReviewRequest(BaseModel):
 
 class CredentialsRequest(BaseModel):
     provider: str
-    api_key: str
+    api_key: str = ""
     base_url: str | None = None
 
 
 class DownshiftRequest(BaseModel):
     target_model: str | None = None
     target_container_id: str | None = None
+
+
+_PM_ROLE_PRIORITY: dict[str, int] = {
+    "architect": 0,
+    "planner": 0,
+    "project_manager": 0,
+    "repo_auditor": 1,
+    "auditor": 1,
+    "engineer": 2,
+    "developer": 2,
+    "worker": 2,
+    "patcher": 2,
+    "coder": 2,
+    "fast_auditor": 3,
+    "fast_router": 4,
+    "triage": 4,
+    "researcher": 5,
+}
+_PM_COST_PRIORITY: dict[str, int] = {
+    "flat_subscription": 0,
+    "local_free": 1,
+    "metered_api": 2,
+}
+_PM_LIGHTWEIGHT_MODEL_MARKERS = ("flash", "hydrogen", "mini", "haiku", "lite", "nano")
+
+
+def _is_swarm_container(container: AgentContainer) -> bool:
+    return container.container_id == "agy_swarm_squad" or container.role == "swarm_squad"
+
+
+def _infer_service_provider(container: AgentContainer) -> str:
+    try:
+        from dagger.agents.generator import infer_service_provider
+
+        return infer_service_provider(container)
+    except ImportError:
+        pass
+    if container.cost_tier == "local_free":
+        return "local"
+    if container.provider in ("claude", "codex", "gemini", "copilot", "agy"):
+        return container.provider
+    cid = container.container_id.lower()
+    burl = (container.base_url or "").lower()
+    model = (container.model or "").lower()
+    if "tavily" in cid or model == "tavily-search":
+        return "tavily"
+    if "groq" in cid or "groq.com" in burl:
+        return "groq"
+    return "api"
+
+
+def _is_non_llm_container(container: AgentContainer, capabilities: list[Any]) -> bool:
+    service_provider = _infer_service_provider(container)
+    if (
+        container.container_id == "tavily_researcher"
+        or service_provider == "tavily"
+        or (container.model or "").strip().lower() == "tavily-search"
+    ):
+        return True
+    matching_caps = [
+        item
+        for item in capabilities
+        if item.provider == container.provider
+        and (container.model is None or item.model_name == container.model)
+    ]
+    if matching_caps and all(getattr(item, "is_llm", True) is False for item in matching_caps):
+        return True
+    return False
+
+
+def _model_matches_available(
+    service_provider: str, container_model: str | None, model: AvailableModel
+) -> bool:
+    if not container_model:
+        return True
+    try:
+        from dagger.agents.generator import match_available_model
+
+        return match_available_model(service_provider, container_model, [model]) is not None
+    except ImportError:
+        pass
+    raw = container_model.strip().lower()
+    if raw == model.model_id.strip().lower():
+        return True
+    if model.display_name and raw == model.display_name.strip().lower():
+        return True
+    if service_provider == "agy":
+        known_aliases = {
+            label.strip().lower(): slug.strip().lower()
+            for slug, label in AgyCliRunner.SUPPORTED_MODEL_SPECS
+        }
+        if known_aliases.get(raw) == model.model_id.strip().lower():
+            return True
+    return False
+
+
+def _pm_container_sort_key(container: AgentContainer) -> tuple[int, int, int, str]:
+    role = container.role.casefold()
+    if role in _PM_ROLE_PRIORITY:
+        role_rank = _PM_ROLE_PRIORITY[role]
+    elif "architect" in role or "plan" in role:
+        role_rank = 0
+    elif "research" in role:
+        role_rank = 5
+    elif "triage" in role or "router" in role:
+        role_rank = 4
+    elif "fast" in role:
+        role_rank = 3
+    elif "auditor" in role:
+        role_rank = 1
+    else:
+        role_rank = 2
+    model_lower = (container.model or "").casefold()
+    is_lightweight = container.cost_tier == "local_free" or any(
+        marker in model_lower for marker in _PM_LIGHTWEIGHT_MODEL_MARKERS
+    )
+    return (
+        role_rank,
+        _PM_COST_PRIORITY.get(container.cost_tier, 3),
+        1 if is_lightweight else 0,
+        container.container_id,
+    )
+
+
+def _select_pm_containers(
+    containers: list[AgentContainer],
+    capabilities: list[Any],
+    provider_models: list[AvailableModel] | None = None,
+) -> list[AgentContainer]:
+    """Return ranked active+healthy non-swarm LLM containers suitable for PM planning."""
+    healthy = {
+        (item.provider, item.model_name)
+        for item in capabilities
+        if item.healthy
+        and getattr(item, "available", True)
+        and getattr(item, "is_llm", True)
+    }
+    discovered_by_provider: dict[str, list[AvailableModel]] = {}
+    for model in provider_models or []:
+        discovered_by_provider.setdefault(model.provider_id.strip().lower(), []).append(model)
+
+    eligible: list[tuple[int, AgentContainer]] = []
+    for item in containers:
+        if not item.active or _is_swarm_container(item) or _is_non_llm_container(item, capabilities):
+            continue
+        if not any(
+            provider == item.provider and (item.model is None or model == item.model)
+            for provider, model in healthy
+        ):
+            continue
+        service_provider = _infer_service_provider(item)
+        sp_models = discovered_by_provider.get(service_provider, [])
+        availability_rank = 0
+        if sp_models:
+            matched = [
+                m for m in sp_models if _model_matches_available(service_provider, item.model, m)
+            ]
+            if matched and all(not m.is_llm for m in matched):
+                continue
+            if any(m.available and m.is_llm for m in matched):
+                availability_rank = 0
+            else:
+                availability_rank = 1
+        eligible.append((availability_rank, item))
+
+    eligible.sort(key=lambda pair: (pair[0], _pm_container_sort_key(pair[1])))
+    return [container for _, container in eligible]
 
 
 def create_app(
@@ -146,29 +324,38 @@ def create_app(
                 async def execute(prompt: str) -> str:
                     containers = await db.list_containers()
                     capabilities = await db.list_capabilities()
-                    healthy = {
-                        (item.provider, item.model_name)
-                        for item in capabilities if item.healthy
-                    }
-                    container = next(
-                        (item for item in containers if item.active and
-                         any(provider == item.provider and
-                             (item.model is None or model == item.model)
-                             for provider, model in healthy)),
-                        None,
-                    )
-                    if container is None:
-                        raise RuntimeError("No available agent container is configured")
-                    manager.provider = container.provider
-                    manager.model = container.model
-                    result = await registry.get(container.provider).run(
-                        container, TaskEnvelope(
-                            task_id=str(uuid4()), run_id=str(uuid4()), kanban_id=str(uuid4()),
-                            prompt=prompt, container_id=container.container_id,
-                            dod=DefinitionOfDone(acceptance_criteria=[]),
-                        )
-                    )
-                    return result if isinstance(result, str) else str(result)
+                    provider_models = await db.list_provider_models()
+                    candidates = _select_pm_containers(containers, capabilities, provider_models)
+                    if not candidates:
+                        raise RuntimeError("No available non-swarm agent container is configured for PM planning")
+                    errors: list[str] = []
+                    for container in candidates:
+                        pm_container = container.model_copy(update={"allowed_tools": ["read", "search"]})
+                        manager.provider = pm_container.provider
+                        manager.model = pm_container.model
+                        try:
+                            result = await registry.get(pm_container.provider).run(
+                                pm_container,
+                                TaskEnvelope(
+                                    task_id=str(uuid4()),
+                                    run_id=str(uuid4()),
+                                    kanban_id=str(uuid4()),
+                                    prompt=prompt,
+                                    container_id=pm_container.container_id,
+                                    worktree_path=str(project_root),
+                                    dod=DefinitionOfDone(acceptance_criteria=[]),
+                                ),
+                            )
+                            return result if isinstance(result, str) else str(result)
+                        except ProviderError as exc:
+                            logger.warning(
+                                "PM planner container %s (%s) failed: %s",
+                                pm_container.container_id,
+                                pm_container.provider,
+                                exc,
+                            )
+                            errors.append(f"{pm_container.container_id} ({pm_container.provider}): {exc}")
+                    raise RuntimeError("All PM planner containers failed: " + "; ".join(errors))
 
                 manager = ProjectManager(planner=execute, worker=execute, workspace=project_root)
                 bus_path = data_path / "bus"
@@ -297,83 +484,209 @@ def create_app(
     async def refresh_catalog():
         return await app.state.generator.refresh_catalog()
 
-    @app.get("/api/providers/status")
-    async def providers_status():
-        capabilities = await app.state.db.list_capabilities()
-        providers: list[dict[str, Any]] = []
-        cli_specs = [
-            ("claude", "Claude Code CLI", "claude"),
-            ("codex", "Codex CLI", "codex"),
-            ("gemini", "Gemini CLI", "gemini"),
-            ("copilot", "GitHub Copilot CLI", "copilot"),
-            ("agy", "Antigravity CLI", "agy"),
-        ]
-        for pid, display, binary in cli_specs:
+    async def _refresh_single_provider(pid: str) -> DiscoveryResult | None:
+        refresh_fn = getattr(app.state.generator, "refresh_provider", None)
+        if callable(refresh_fn):
+            result = await refresh_fn(pid)
+            return result if isinstance(result, DiscoveryResult) else None
+        await app.state.generator.refresh_catalog()
+        return None
+
+    async def _build_provider_status(
+        pid: str,
+        *,
+        capabilities: list[Any] | None = None,
+        models_by_provider: dict[str, list[AvailableModel]] | None = None,
+        discovery_override: DiscoveryResult | None = None,
+    ) -> ProviderCredentialStatus:
+        meta = SERVICE_PROVIDER_BY_ID[pid]
+        caps = capabilities if capabilities is not None else await app.state.db.list_capabilities()
+        if models_by_provider is not None:
+            db_models = models_by_provider.get(pid, [])
+        else:
+            db_models = await app.state.db.list_provider_models(pid)
+
+        last_map = getattr(app.state.generator, "last_discovery", None)
+        last_disc: DiscoveryResult | None = (
+            discovery_override
+            if discovery_override is not None
+            else (last_map.get(pid) if isinstance(last_map, dict) else None)
+        )
+
+        if discovery_override is not None:
+            provider_models = list(discovery_override.models)
+        else:
+            provider_models = db_models if db_models else (list(last_disc.models) if last_disc is not None else [])
+
+        available_models = [item for item in provider_models if item.available]
+        supports_base_url = bool(meta["supports_base_url"])
+        configured_url = get_base_url(pid) if supports_base_url else None
+        if pid == "local":
+            base_url = (
+                configured_url
+                or (last_disc.base_url if last_disc and last_disc.base_url else None)
+                or meta.get("default_base_url")
+            )
+        elif pid == "api":
+            base_url = configured_url
+        else:
+            base_url = None
+
+        if last_disc is not None:
+            discovery_status = last_disc.discovery_status
+            discovery_error = last_disc.discovery_error
+            last_discovered_at = last_disc.checked_at
+        elif provider_models:
+            last_discovered_at = max(m.last_checked for m in provider_models)
+            if any(m.discovery_source == "fallback" for m in provider_models):
+                discovery_status = "fallback"
+            elif available_models:
+                discovery_status = "ok"
+            else:
+                discovery_status = "unverified"
+            discovery_error = None
+        else:
+            discovery_status = "unverified"
+            discovery_error = None
+            last_discovered_at = None
+
+        kind = meta["kind"]
+        if kind == "subscription_cli":
+            binary = meta["binary"]
             found = shutil.which(binary)
-            prov_caps = [item for item in capabilities if item.provider == pid]
+            prov_caps = [
+                item
+                for item in caps
+                if (getattr(item, "service_provider", None) or item.provider) == pid
+            ]
             if not found:
                 status = "missing_binary"
                 detail = f"{binary} binary not found in PATH"
+            elif last_disc is not None:
+                status = last_disc.status
+                detail = last_disc.detail
             elif pid == "gemini":
-                from dagger.agents.generator import _has_gemini_auth
-
-                if not _has_gemini_auth():
-                    status = "expired"
-                    detail = "gemini CLI found, but no active selectedType/oauth_creds.json or API/Vertex/GCA env"
+                if not has_gemini_subscription_auth():
+                    status = "unauthenticated"
+                    detail = "gemini CLI found, but no subscription OAuth/GCA/Vertex credentials configured"
                 elif prov_caps and not any(item.healthy for item in prov_caps):
                     status = "expired"
                     detail = f"{binary} found at {found}, but health check failed"
                 else:
                     status = "authenticated"
                     detail = f"Found at {found}"
+            elif pid == "copilot":
+                if prov_caps and any(item.healthy for item in prov_caps):
+                    status = "authenticated"
+                    detail = f"Found at {found}"
+                elif prov_caps and not any(item.healthy for item in prov_caps):
+                    status = "unauthenticated"
+                    detail = f"{binary} found at {found}, but not authenticated (run copilot login)"
+                elif has_copilot_local_auth():
+                    status = "authenticated"
+                    detail = f"Found at {found}"
+                else:
+                    status = "unauthenticated"
+                    detail = f"{binary} found at {found}, but not authenticated (run copilot login)"
             elif prov_caps and not any(item.healthy for item in prov_caps):
                 status = "expired"
                 detail = f"{binary} found at {found}, but health check failed"
             else:
                 status = "authenticated"
                 detail = f"Found at {found}"
-            providers.append(
-                ProviderCredentialStatus(
-                    provider_id=pid,
-                    display_name=display,
-                    kind="subscription_cli",
-                    status=status,
-                    detail=detail,
-                    supports_login=True,
-                    supports_api_key=False,
-                ).model_dump()
-            )
-        for pid, display, env_key in (
-            ("groq", "Groq API", "GROQ_API_KEY"),
-            ("tavily", "Tavily Search API", "TAVILY_API_KEY"),
-        ):
+        elif kind == "api_key":
+            env_key = meta["env_key"]
             configured = bool(get_vault_credential(env_key))
-            providers.append(
-                ProviderCredentialStatus(
-                    provider_id=pid,
-                    display_name=display,
-                    kind="api_key",
-                    status="api_key_configured" if configured else "unconfigured",
-                    detail="Configured in local vault/env" if configured else "No API key configured",
-                    supports_login=False,
-                    supports_api_key=True,
-                ).model_dump()
+            if last_disc is not None:
+                if not configured and last_disc.status not in ("unauthenticated", "unconfigured"):
+                    status = "unauthenticated"
+                    detail = "No API key configured"
+                else:
+                    status = last_disc.status
+                    detail = last_disc.detail
+            elif configured:
+                status = "configured"
+                if pid == "api" and not base_url:
+                    detail = "API key configured; set Base URL to discover available models"
+                else:
+                    detail = "Configured in local vault/env"
+            else:
+                status = "unauthenticated"
+                detail = "No API key configured"
+        else:
+            if last_disc is not None:
+                status = last_disc.status
+                detail = last_disc.detail
+            else:
+                local_healthy = any(
+                    (getattr(item, "service_provider", None) == "local" or item.cost_tier == "local_free")
+                    and item.healthy
+                    for item in caps
+                ) or bool(available_models)
+                status = "authenticated" if local_healthy else "unreachable"
+                detail = (
+                    f"Healthy local endpoint detected at {base_url}"
+                    if local_healthy
+                    else f"No local endpoint active at {base_url}"
+                )
+
+        return ProviderCredentialStatus(
+            provider_id=pid,
+            display_name=meta["display_name"],
+            kind=kind,
+            status=status,
+            detail=detail,
+            supports_login=bool(meta["supports_login"]),
+            supports_api_key=bool(meta["supports_api_key"]),
+            supports_base_url=supports_base_url,
+            requires_api_key=bool(meta["requires_api_key"]),
+            base_url=base_url,
+            category=meta["category"],
+            available_models=available_models,
+            available_model_count=len(available_models),
+            discovery_status=discovery_status,
+            discovery_error=discovery_error,
+            last_discovered_at=last_discovered_at,
+        )
+
+    @app.get("/api/providers/status")
+    async def providers_status():
+        capabilities = await app.state.db.list_capabilities()
+        all_models = await app.state.db.list_provider_models()
+        models_by_provider: dict[str, list[AvailableModel]] = {}
+        for model in all_models:
+            models_by_provider.setdefault(model.provider_id.strip().lower(), []).append(model)
+        providers: list[dict[str, Any]] = []
+        for meta in SERVICE_PROVIDER_METADATA:
+            item = await _build_provider_status(
+                meta["provider_id"],
+                capabilities=capabilities,
+                models_by_provider=models_by_provider,
             )
-        local_healthy = any(
-            item.cost_tier == "local_free" and item.healthy for item in capabilities
-        )
-        providers.append(
-            ProviderCredentialStatus(
-                provider_id="local",
-                display_name="Local OpenAI-Compatible",
-                kind="local",
-                status="authenticated" if local_healthy else "unconfigured",
-                detail="Healthy local endpoint detected" if local_healthy else "No local endpoint active",
-                supports_login=False,
-                supports_api_key=False,
-            ).model_dump()
-        )
+            providers.append(item.model_dump(mode="json"))
         return {"providers": providers}
+
+    @app.get("/api/models")
+    async def list_models(
+        provider_id: str | None = None,
+        available_only: bool = False,
+        llm_only: bool = False,
+    ):
+        models = await app.state.db.list_provider_models(
+            provider_id,
+            available_only=available_only,
+            llm_only=llm_only,
+        )
+        return {"models": [item.model_dump(mode="json") for item in models]}
+
+    @app.post("/api/providers/{provider_id}/refresh")
+    async def refresh_provider(provider_id: str):
+        pid = provider_id.strip().lower()
+        if pid not in SERVICE_PROVIDER_BY_ID:
+            raise HTTPException(status_code=400, detail=f"Unknown provider: {provider_id}")
+        disc = await _refresh_single_provider(pid)
+        status_obj = await _build_provider_status(pid, discovery_override=disc)
+        return status_obj.model_dump(mode="json")
 
     async def _terminate_login_session(session: dict[str, Any] | None) -> None:
         if not session:
@@ -465,14 +778,66 @@ def create_app(
 
     @app.post("/api/providers/{provider_id}/login")
     async def provider_login(provider_id: str):
+        pid = provider_id.strip().lower()
+        if pid in ("agy", "gemini"):
+            if not shutil.which(pid):
+                raise HTTPException(status_code=400, detail=f"{pid} binary not found in PATH")
+            refresh_fn = getattr(app.state.generator, "refresh_provider", None)
+            if callable(refresh_fn):
+                disc = await refresh_fn(pid)
+            else:
+                disc = await discover_provider_models(pid)
+                await app.state.db.replace_provider_models(pid, disc.models)
+            status_obj = await _build_provider_status(
+                pid,
+                discovery_override=disc if isinstance(disc, DiscoveryResult) else None,
+            )
+            avail_models = [item.model_dump(mode="json") for item in status_obj.available_models]
+            if status_obj.status == "authenticated":
+                return {
+                    "provider_id": pid,
+                    "status": "authenticated",
+                    "requires_callback": False,
+                    "message": (
+                        f"{status_obj.display_name} is authenticated "
+                        f"({status_obj.available_model_count} available models)."
+                    ),
+                    "auth_url": None,
+                    "device_url": None,
+                    "device_code": None,
+                    "available_models": avail_models,
+                    "provider_status": status_obj.model_dump(mode="json"),
+                }
+            if pid == "agy":
+                guidance = (
+                    "Antigravity CLI (`agy`) does not provide a non-interactive login subcommand.\n"
+                    "Sign in through your local Antigravity IDE / CLI session so `agy models` succeeds, "
+                    'then click "Check Login Status" to verify authentication and discover available models.'
+                )
+            else:
+                guidance = (
+                    "Gemini CLI requires an interactive terminal for Google OAuth sign-in.\n"
+                    "Run `gemini` once in an interactive terminal to sign in with your Google subscription "
+                    "(stored in ~/.gemini/settings.json and ~/.gemini/oauth_creds.json), "
+                    'then click "Check Login Status" to verify authentication and discover available models.'
+                )
+            return {
+                "provider_id": pid,
+                "status": "manual_action_required",
+                "requires_callback": False,
+                "message": guidance,
+                "auth_url": None,
+                "device_url": None,
+                "device_code": None,
+                "available_models": avail_models,
+                "provider_status": status_obj.model_dump(mode="json"),
+            }
+
         login_cmds = {
             "claude": ["claude", "auth", "login"],
             "codex": ["codex", "login"],
-            "gemini": ["gemini"],
-            "copilot": ["copilot", "auth", "login"],
-            "agy": ["agy", "auth", "login"],
+            "copilot": ["copilot", "login"],
         }
-        pid = provider_id.lower()
         cmd = login_cmds.get(pid)
         if cmd is None:
             raise HTTPException(status_code=400, detail=f"Login not supported for provider: {provider_id}")
@@ -480,6 +845,7 @@ def create_app(
             return {
                 "provider_id": pid,
                 "status": "missing_binary",
+                "requires_callback": False,
                 "message": f"{cmd[0]} binary not found in PATH",
                 "auth_url": None,
                 "device_url": None,
@@ -490,18 +856,7 @@ def create_app(
         await _terminate_login_session(login_sessions.pop(pid, None))
         try:
             env = os.environ.copy()
-            for key in (
-                "GROQ_API_KEY",
-                "TAVILY_API_KEY",
-                "DAGGER_API_KEY",
-                "DAGGER_API_BASE_URL",
-                "OPENAI_API_KEY",
-                "ANTHROPIC_API_KEY",
-                "GEMINI_API_KEY",
-                "GOOGLE_API_KEY",
-                "GITHUB_TOKEN",
-                "GH_TOKEN",
-            ):
+            for key in CLI_PROBE_STRIPPED_ENV:
                 env.pop(key, None)
             env["BROWSER"] = "echo"
             proc = await asyncio.create_subprocess_exec(
@@ -516,6 +871,7 @@ def create_app(
             return {
                 "provider_id": pid,
                 "status": "error",
+                "requires_callback": False,
                 "message": str(exc),
                 "auth_url": None,
                 "device_url": None,
@@ -529,6 +885,7 @@ def create_app(
             return {
                 "provider_id": pid,
                 "status": "error",
+                "requires_callback": False,
                 "message": output or f"{pid} login exited with code {proc.returncode}",
                 "auth_url": None,
                 "device_url": None,
@@ -543,6 +900,7 @@ def create_app(
         return {
             "provider_id": pid,
             "status": "awaiting_callback",
+            "requires_callback": True,
             "message": output or f"Started {pid} login flow",
             "auth_url": auth_url,
             "device_url": auth_url,
@@ -550,86 +908,110 @@ def create_app(
         }
 
     @app.post("/api/providers/{provider_id}/login/complete")
-    async def provider_login_complete(provider_id: str, req: LoginCompleteRequest):
-        pid = provider_id.lower()
+    async def provider_login_complete(provider_id: str, req: LoginCompleteRequest | None = None):
+        pid = provider_id.strip().lower()
+        meta = SERVICE_PROVIDER_BY_ID.get(pid)
+        if meta is None or not meta["supports_login"]:
+            raise HTTPException(status_code=400, detail=f"Login not supported for provider: {provider_id}")
+
+        raw = (req.input if req is not None else "").strip()
+        target_url: str | None = None
+        if raw:
+            lowered = raw.lower()
+            if lowered.startswith("http://") or lowered.startswith("https://"):
+                try:
+                    parsed = urlsplit(raw)
+                    port = parsed.port
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid callback URL: only http://localhost:<port> or http://127.0.0.1:<port> is allowed",
+                    ) from None
+                if (
+                    parsed.scheme != "http"
+                    or parsed.hostname not in {"localhost", "127.0.0.1"}
+                    or parsed.username is not None
+                    or parsed.password is not None
+                    or port is None
+                    or not (1 <= port <= 65535)
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid callback URL: only http://localhost:<port> or http://127.0.0.1:<port> is allowed",
+                    )
+                target_url = f"http://127.0.0.1:{port}{parsed.path or ''}"
+                if parsed.query:
+                    target_url = f"{target_url}?{parsed.query}"
+
         login_sessions: dict[str, dict[str, Any]] = getattr(app.state, "login_sessions", {})
         session = login_sessions.get(pid)
-        if session is None:
-            raise HTTPException(status_code=404, detail=f"No active login session for provider: {provider_id}")
-        raw = req.input.strip()
-        if not raw:
-            raise HTTPException(status_code=400, detail="Input must not be empty")
 
-        proc = session["proc"]
-        lowered = raw.lower()
-        target_url: str | None = None
-        if lowered.startswith("http://") or lowered.startswith("https://"):
+        if session is not None and raw:
+            proc = session["proc"]
             try:
-                parsed = urlsplit(raw)
-                port = parsed.port
-            except ValueError:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid callback URL: only http://localhost:<port> or http://127.0.0.1:<port> is allowed",
-                ) from None
-            if (
-                parsed.scheme != "http"
-                or parsed.hostname not in {"localhost", "127.0.0.1"}
-                or parsed.username is not None
-                or parsed.password is not None
-                or port is None
-                or not (1 <= port <= 65535)
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid callback URL: only http://localhost:<port> or http://127.0.0.1:<port> is allowed",
-                )
-            target_url = f"http://127.0.0.1:{port}{parsed.path or ''}"
-            if parsed.query:
-                target_url = f"{target_url}?{parsed.query}"
-
-        try:
-            if target_url is not None:
-                try:
-                    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
-                        await client.get(target_url)
-                except (httpx.HTTPError, OSError) as exc:
-                    logger.warning("Localhost callback relay failed for %s: %s", pid, exc)
-            else:
-                stdin = getattr(proc, "stdin", None)
-                if stdin is not None:
+                if target_url is not None:
                     try:
-                        stdin.write((raw + "\n").encode("utf-8"))
-                        if hasattr(stdin, "drain"):
-                            await stdin.drain()
-                    except (BrokenPipeError, OSError) as exc:
-                        logger.warning("Failed writing login code to %s stdin: %s", pid, exc)
+                        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+                            await client.get(target_url)
+                    except (httpx.HTTPError, OSError) as exc:
+                        logger.warning("Localhost callback relay failed for %s: %s", pid, exc)
+                else:
+                    stdin = getattr(proc, "stdin", None)
+                    if stdin is not None:
+                        try:
+                            stdin.write((raw + "\n").encode("utf-8"))
+                            if hasattr(stdin, "drain"):
+                                await stdin.drain()
+                        except (BrokenPipeError, OSError) as exc:
+                            logger.warning("Failed writing login code to %s stdin: %s", pid, exc)
 
-            if getattr(proc, "returncode", None) is None and hasattr(proc, "wait"):
+                if getattr(proc, "returncode", None) is None and hasattr(proc, "wait"):
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        await _terminate_login_session(session)
+            finally:
+                await _terminate_login_session(session)
+                login_sessions.pop(pid, None)
+
+            await app.state.generator.refresh_catalog()
+            status_obj = await _build_provider_status(pid)
+            return status_obj.model_dump(mode="json")
+
+        if session is not None:
+            proc = session["proc"]
+            if getattr(proc, "returncode", None) is not None:
+                login_sessions.pop(pid, None)
+            elif hasattr(proc, "wait"):
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    await asyncio.wait_for(proc.wait(), timeout=0.25)
+                    login_sessions.pop(pid, None)
                 except asyncio.TimeoutError:
-                    await _terminate_login_session(session)
-        finally:
-            await _terminate_login_session(session)
-            login_sessions.pop(pid, None)
+                    pass
 
-        await app.state.generator.refresh_catalog()
-        status_payload = await providers_status()
-        for item in status_payload.get("providers", []):
-            if item.get("provider_id") == pid:
-                return item
-        raise HTTPException(status_code=404, detail=f"Provider status not found for: {provider_id}")
+        disc = await _refresh_single_provider(pid)
+        status_obj = await _build_provider_status(pid, discovery_override=disc)
+        return status_obj.model_dump(mode="json")
 
     @app.post("/api/providers/credentials")
     async def save_credentials(req: CredentialsRequest):
+        pid = req.provider.strip().lower()
         try:
-            save_provider_credentials(req.provider, req.api_key, base_url=req.base_url)
+            save_provider_credentials(pid, req.api_key, base_url=req.base_url)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
-        await app.state.generator.refresh_catalog()
+        disc = await _refresh_single_provider(pid)
         caps = await app.state.db.list_capabilities()
-        return {"status": "saved", "provider": req.provider.lower(), "catalog_count": len(caps)}
+        status_obj = await _build_provider_status(pid, capabilities=caps, discovery_override=disc)
+        available_models = [item.model_dump(mode="json") for item in status_obj.available_models]
+        return {
+            "status": "saved",
+            "provider": pid,
+            "catalog_count": len(caps),
+            "available_models": available_models,
+            "available_model_count": len(available_models),
+            "provider_status": status_obj.model_dump(mode="json"),
+        }
 
     @app.get("/api/usage/summary")
     async def usage_summary():
@@ -666,7 +1048,9 @@ def create_app(
                 target_container_id=body.target_container_id,
             )
         except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from None
+            detail = str(exc)
+            status_code = 404 if detail.lower().startswith("unknown container") else 400
+            raise HTTPException(status_code=status_code, detail=detail) from None
         return {"status": "downshifted", "container": container}
 
     @app.get("/api/tasks")

@@ -503,3 +503,140 @@ async def test_standalone_run_duplicate_failure_short_circuits_before_third_hop(
     assert report.status == "human_review_required"
     assert report.hops == 2
     assert len(worker_calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        lambda raw: f"```json\n{raw}\n```",
+        lambda raw: f"```\n{raw}\n```",
+        lambda raw: f"Here is the milestone DAG:\n\n```json\n{raw}\n```\n\nLet me know if you want changes.",
+        lambda raw: f"Note: use {{worktree}} paths.\n{raw}\nDone planning.",
+    ],
+)
+async def test_decompose_goal_parses_markdown_fenced_and_prose_wrapped_json(wrapper):
+    payload = json.dumps({
+        "milestones": [
+            {
+                "milestone_id": "m1",
+                "title": "Assess state",
+                "description": "Inspect code and ```sh\necho ok\n``` snippets",
+                "depends_on": [],
+                "dod": {
+                    "acceptance_criteria": ["README exists"],
+                    "expected_artifacts": ["README.md"],
+                    "verification_commands": ["test -f README.md"],
+                },
+            },
+            {
+                "milestone_id": "m2",
+                "title": "Plan sprints",
+                "description": "Draft sprint backlog",
+                "depends_on": ["m1"],
+                "dod": {
+                    "acceptance_criteria": ["README non-empty"],
+                    "expected_artifacts": ["README.md"],
+                    "verification_commands": ["test -s README.md"],
+                },
+            },
+        ]
+    })
+
+    async def planner(_):
+        return wrapper(payload)
+
+    dag = await ProjectManager(planner=planner, workspace=ROOT).decompose_goal(
+        KanbanTask(title="Assess repo", description="Build roadmap")
+    )
+    assert [m.milestone_id for m in dag.milestones] == ["m1", "m2"]
+    assert dag.dependencies == {"m1": (), "m2": ("m1",)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_response",
+    [
+        "",
+        "   \n  ",
+        "Sorry, I could not generate a plan.",
+        "```json\n{\"milestones\": [broken\n```",
+        "Here is broken JSON: {not valid json}",
+        None,
+    ],
+)
+async def test_decompose_goal_rejects_invalid_or_non_json_prose(bad_response):
+    async def planner(_):
+        return bad_response
+
+    with pytest.raises(ValueError, match="planner returned invalid JSON"):
+        await ProjectManager(planner=planner, workspace=ROOT).decompose_goal(
+            KanbanTask(title="goal")
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_plan_parses_fenced_and_wrapped_json_and_fails_closed():
+    raw_plan = json.dumps({
+        "tasks": [
+            {
+                "id": "t1",
+                "description": "Verify README",
+                "definition_of_done": [{"description": "README exists", "command": ["test", "-f", "README.md"]}],
+            }
+        ]
+    })
+
+    async def fenced(_):
+        return f"Plan:\n```json\n{raw_plan}\n```"
+
+    plan = await ProjectManager(planner=fenced, workspace=ROOT).create_plan("Ship it")
+    assert [t.id for t in plan.tasks] == ["t1"]
+
+    async def wrapped(_):
+        return f"Sure! {raw_plan} Hope that helps."
+
+    plan2 = await ProjectManager(planner=wrapped, workspace=ROOT).create_plan("Ship it")
+    assert [t.id for t in plan2.tasks] == ["t1"]
+
+    async def invalid(_):
+        return "Not JSON at all"
+
+    with pytest.raises(ValueError, match="planner returned invalid JSON"):
+        await ProjectManager(planner=invalid, workspace=ROOT).create_plan("Ship it")
+
+
+@pytest.mark.asyncio
+async def test_pm_plan_node_emits_stderr_card_log_on_planner_exception(tmp_path):
+    from dagger.agents.orchestrator import Orchestrator
+    from dagger.db import DatabaseManager
+    from dagger.providers import ProviderRegistry
+
+    async def broken_planner(_):
+        return "not valid json prose"
+
+    async with DatabaseManager(tmp_path / "board.sqlite", seed_path=False) as db:
+        pm = ProjectManager(planner=broken_planner, workspace=tmp_path)
+        pm.provider = "agy"  # type: ignore[attr-defined]
+        orchestrator = Orchestrator(
+            db,
+            ProviderRegistry(defaults=False),
+            pm,
+            worktree_path=tmp_path,
+            bus_path=tmp_path / "bus",
+        )
+        with pytest.raises(ValueError, match="planner returned invalid JSON"):
+            await orchestrator.start("run-fail-plan", "Broken goal", kanban_id="card-fail-plan")
+
+        task = await db.get_task("card-fail-plan")
+        assert task is not None
+        assert task.status == "Failed"
+
+        logs = await db.list_card_logs("card-fail-plan", run_id="run-fail-plan")
+        stderr_logs = [
+            entry for entry in logs
+            if entry["node_id"] == "pm_plan_node" and entry["channel"] == "stderr"
+        ]
+        assert len(stderr_logs) == 1
+        assert stderr_logs[0]["provider"] == "agy"
+        assert "planner returned invalid JSON" in stderr_logs[0]["text"]

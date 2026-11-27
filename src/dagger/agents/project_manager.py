@@ -22,7 +22,9 @@ Executor = Callable[[str], Awaitable[str]]
 
 SECRETS_ENV_VARS = frozenset({
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
-    "GITHUB_TOKEN", "GH_TOKEN", "TAVILY_API_KEY",
+    "GITHUB_TOKEN", "GH_TOKEN", "TAVILY_API_KEY", "GROQ_API_KEY",
+    "DAGGER_API_KEY", "DAGGER_API_BASE_URL", "DAGGER_LOCAL_API_KEY",
+    "DAGGER_LOCAL_BASE_URL", "COPILOT_GITHUB_TOKEN",
 })
 
 _NUMERIC_TEST_OPS: dict[str, str] = {
@@ -652,6 +654,82 @@ def _text(value: object, field: str) -> str:
     return value.strip()
 
 
+_FENCED_BLOCK_RE = re.compile(r"```([a-zA-Z0-9_-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
+_OUTER_FENCE_OPEN_RE = re.compile(r"^```[a-zA-Z0-9_-]*[ \t]*\r?\n")
+_OUTER_FENCE_CLOSE_RE = re.compile(r"\r?\n?```$")
+
+
+def _parse_planner_json(response: object) -> object:
+    """Parse planner JSON, tolerating markdown code fences or brief surrounding prose.
+
+    Fails closed with ValueError("planner returned invalid JSON") if no valid JSON
+    object can be extracted.
+    """
+    if not isinstance(response, str):
+        raise ValueError("planner returned invalid JSON")
+    stripped = response.strip()
+    if not stripped:
+        raise ValueError("planner returned invalid JSON")
+
+    # 1. Fast path: response is already pure JSON.
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Strip outermost markdown code fence if the entire response is fenced.
+    if stripped.startswith("```") and stripped.endswith("```"):
+        inner = _OUTER_FENCE_OPEN_RE.sub("", stripped, count=1)
+        inner = _OUTER_FENCE_CLOSE_RE.sub("", inner, count=1).strip()
+        if inner:
+            try:
+                parsed = json.loads(inner)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+    # 3. Inspect fenced code blocks (preferring ```json blocks).
+    matches = list(_FENCED_BLOCK_RE.finditer(stripped))
+    ordered_blocks = sorted(
+        matches,
+        key=lambda m: (0 if m.group(1).strip().lower() == "json" else 1, m.start()),
+    )
+    for match in ordered_blocks:
+        candidate = match.group(2).strip()
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # 4. Extract top-level JSON object(s) embedded in brief preamble/postamble prose.
+    decoder = json.JSONDecoder()
+    candidates: list[tuple[int, int, dict]] = []
+    idx = 0
+    n = len(stripped)
+    while idx < n:
+        pos = stripped.find("{", idx)
+        if pos == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(stripped, pos)
+        except json.JSONDecodeError:
+            idx = pos + 1
+            continue
+        if isinstance(obj, dict):
+            candidates.append((end - pos, pos, obj))
+        idx = end
+    if candidates:
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        return candidates[0][2]
+
+    raise ValueError("planner returned invalid JSON")
+
+
 def _items(value: object, field: str) -> Sequence:
     if not isinstance(value, (list, tuple)) or not value:
         raise ValueError(f"{field} must be a non-empty array")
@@ -857,10 +935,7 @@ class ProjectManager:
             + json.dumps({"title": task.title, "description": task.description}, ensure_ascii=False)
         )
         response = await planner(prompt)
-        try:
-            value = json.loads(response)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("planner returned invalid JSON") from exc
+        value = _parse_planner_json(response)
         if not isinstance(value, dict):
             raise ValueError("milestone plan must be an object")
         raw_milestones = _items(value.get("milestones"), "milestones")
@@ -1037,10 +1112,7 @@ class ProjectManager:
         response = await planner(prompt)
         if not isinstance(response, str):
             raise ValueError("planner must return a JSON string")
-        try:
-            value = json.loads(response)
-        except json.JSONDecodeError as exc:
-            raise ValueError("planner returned invalid JSON") from exc
+        value = _parse_planner_json(response)
         return Plan.from_dict(value, goal=goal)
 
     async def verify(self, task: PlannedTask) -> tuple[VerificationResult, ...]:

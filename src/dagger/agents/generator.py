@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -22,7 +22,24 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import URL
 
-from dagger.schema import AgentContainer, EndpointCapability
+from dagger.providers.cli_runners import AgyCliRunner
+from dagger.providers.discovery import (
+    CLI_PROBE_STRIPPED_ENV,
+    DEFAULT_GROQ_BASE_URL,
+    SERVICE_PROVIDER_BY_ID,
+    SERVICE_PROVIDER_METADATA,
+    DiscoveryResult,
+    _CLAUDE_CURATED_MODELS,
+    _CODEX_CURATED_MODELS,
+    _COPILOT_FALLBACK_MODELS,
+    _GEMINI_FALLBACK_MODELS,
+    discover_provider_models,
+    has_copilot_local_auth,
+    has_gemini_subscription_auth,
+    is_auth_output_healthy,
+)
+from dagger.schema import AgentContainer, AvailableModel, EndpointCapability
+from dagger.vault import get_base_url, get_vault_credential, load_vault_credentials
 
 if TYPE_CHECKING:
     from dagger.db import DatabaseManager
@@ -33,23 +50,30 @@ _GENERATORS: dict[str, "AgentGenerator"] = {}
 _AUTH_COMMANDS = {
     "claude": ("auth", "status"),
     "codex": ("login", "status"),
-    "gemini": ("auth", "status"),
-    "copilot": ("auth", "status"),
 }
-_API_KEYS = (
-    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
-    "GITHUB_TOKEN", "GH_TOKEN", "GROQ_API_KEY", "TAVILY_API_KEY",
-    "DAGGER_API_KEY", "DAGGER_API_BASE_URL",
-)
+_API_KEYS = CLI_PROBE_STRIPPED_ENV
 _DOWNSHIFT_DEFAULTS: dict[str, str] = {
     "claude": "claude-haiku-4-5",
     "codex": "gpt-4.1-mini",
-    "gemini": "gemini-2.5-flash",
-    "copilot": "gpt-4.1-mini",
+    "gemini": "gemini-3.5-flash",
+    "copilot": "gpt-5-mini",
     "groq": "llama-3.1-8b-instant",
     "api": "gpt-4o-mini",
     "agy": "gemini-4-hydrogen-low",
 }
+_LIGHTWEIGHT_MODEL_MARKERS: tuple[str, ...] = (
+    "mini",
+    "flash",
+    "lite",
+    "haiku",
+    "instant",
+    "8b",
+    "7b",
+    "3b",
+    "hydrogen",
+    "nano",
+    "small",
+)
 _COST_RANK_BY_TIER: dict[str, int] = {
     "local_free": 0,
     "flat_subscription": 1,
@@ -60,7 +84,7 @@ _CLI_BASELINES = {
     "codex": ("gpt-5-codex", 128_000, ["coding", "testing"], ["Requires Codex CLI authentication"]),
     "gemini": ("gemini-2.5-pro", 1_000_000, ["analysis", "review"], ["Requires Gemini CLI authentication"]),
     "copilot": ("gpt-4.1", 128_000, ["coding", "patching"], ["Requires Copilot CLI authentication"]),
-    "agy": ("gemini-4-hydrogen", 1_000_000, ["review", "analysis"], ["Requires Antigravity CLI"]),
+    "agy": ("Gemini 4 Hydrogen (Low)", 1_000_000, ["review", "analysis"], ["Requires Antigravity CLI"]),
 }
 _RESEARCH_QUERIES = (
     "recent AI model releases and capabilities",
@@ -74,6 +98,94 @@ _SUSPICIOUS_RESEARCH = re.compile(
 )
 
 
+def infer_service_provider(container: AgentContainer) -> str:
+    """Classify a container into its canonical 9-provider service ID."""
+    provider = container.provider.strip().lower()
+    if provider != "api":
+        return provider
+    cid = container.container_id.strip().lower()
+    burl = (container.base_url or "").strip().lower()
+    model = (container.model or "").strip().lower()
+    if "groq" in cid or "groq.com" in burl:
+        return "groq"
+    if "tavily" in cid or model == "tavily-search":
+        return "tavily"
+    if container.cost_tier == "local_free" or cid == "local_triage":
+        return "local"
+    if burl:
+        host = (urlsplit(burl).hostname or "").lower()
+        if host in {"127.0.0.1", "localhost", "::1"} and "custom" not in cid:
+            return "local"
+    return "api"
+
+
+def match_available_model(
+    provider_id: str,
+    model: str | None,
+    available_models: list[AvailableModel],
+) -> AvailableModel | None:
+    """Match a model string against a provider's available models without cross-provider fallback."""
+    if not model or not model.strip() or not available_models:
+        return None
+    raw = model.strip()
+    lowered = raw.lower()
+    for item in available_models:
+        if item.model_id.lower() == lowered:
+            return item
+        if item.display_name and item.display_name.lower() == lowered:
+            return item
+
+    if provider_id.strip().lower() == "agy":
+        # Resolve exact agy label / slug / punctuation aliases WITHOUT falling back to unknown defaults.
+        mapped = AgyCliRunner._LABEL_TO_SLUG.get(lowered)
+        if mapped is None:
+            slug_candidate = lowered.replace("_", "-").replace(" ", "-")
+            mapped = AgyCliRunner._SLUG_MAP.get(slug_candidate)
+            if mapped is None and slug_candidate in AgyCliRunner._FAMILY_ALIASES:
+                family = AgyCliRunner._FAMILY_ALIASES[slug_candidate]
+                default_tier = AgyCliRunner._DEFAULT_TIER_BY_FAMILY[family]
+                mapped = AgyCliRunner._FAMILY_TIERS[family][default_tier]
+        if mapped:
+            for item in available_models:
+                if item.model_id.lower() == mapped.lower():
+                    return item
+    return None
+
+
+def _pick_lighter_available_model(
+    service_provider: str,
+    current_model: str | None,
+    available_llms: list[AvailableModel],
+) -> AvailableModel | None:
+    """Select the best lighter/cheaper available LLM for a single provider."""
+    if not available_llms:
+        return None
+    current_match = match_available_model(service_provider, current_model, available_llms)
+    current_id = current_match.model_id.lower() if current_match else (current_model or "").strip().lower()
+
+    preferred = _DOWNSHIFT_DEFAULTS.get(service_provider)
+    if preferred:
+        pref_match = match_available_model(service_provider, preferred, available_llms)
+        if pref_match is not None and pref_match.model_id.lower() != current_id:
+            return pref_match
+
+    def _is_light(m: AvailableModel) -> bool:
+        hay = f"{m.model_id} {m.display_name or ''}".lower()
+        return any(marker in hay for marker in _LIGHTWEIGHT_MODEL_MARKERS)
+
+    others = [m for m in available_llms if m.model_id.lower() != current_id]
+    light_others = [m for m in others if _is_light(m)]
+    if light_others:
+        return light_others[0]
+    if preferred:
+        pref_match = match_available_model(service_provider, preferred, available_llms)
+        if pref_match is not None:
+            return pref_match
+    if others:
+        return others[0]
+    return available_llms[0]
+
+
 async def _run_scheduled_generator(key: str) -> None:
     generator = _GENERATORS.get(key)
     if generator is None:
@@ -83,31 +195,8 @@ async def _run_scheduled_generator(key: str) -> None:
 
 
 def _has_gemini_auth() -> bool:
-    """Return True when Gemini CLI has valid OAuth/settings or API/Vertex/GCA env credentials."""
-    if os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip():
-        return True
-    for flag in ("GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA"):
-        val = os.environ.get(flag, "").strip().lower()
-        if val and val not in {"false", "0", "no"}:
-            return True
-    gemini_dir = Path.home() / ".gemini"
-    settings_path = gemini_dir / "settings.json"
-    if not settings_path.is_file():
-        return False
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(settings, dict):
-        return False
-    security = settings.get("security")
-    auth = security.get("auth") if isinstance(security, dict) else None
-    selected = settings.get("selectedType") or (auth.get("selectedType") if isinstance(auth, dict) else None)
-    if not selected:
-        return False
-    if selected == "oauth-personal":
-        return (gemini_dir / "oauth_creds.json").is_file()
-    return True
+    """Return True when Gemini CLI has valid subscription OAuth/GCA/Vertex credentials."""
+    return has_gemini_subscription_auth()
 
 
 class AgentGenerator:
@@ -140,6 +229,7 @@ class AgentGenerator:
         self._run_lock = asyncio.Lock()
         self._scheduled_tasks: set[asyncio.Task] = set()
         self.research_findings: list[dict[str, str]] = []
+        self.last_discovery: dict[str, DiscoveryResult] = {}
 
     def start(self) -> None:
         """Start the persistent scheduler from a running event loop."""
@@ -217,22 +307,7 @@ class AgentGenerator:
 
     @staticmethod
     def _is_auth_output_healthy(auth_ok: bool, status: str) -> bool:
-        normalized = status.lower()
-        try:
-            details = json.loads(status)
-        except (ValueError, TypeError):
-            details = None
-        denied = isinstance(details, dict) and any(
-            details.get(field) is False for field in ("loggedIn", "logged_in", "authenticated")
-        )
-        return (
-            auth_ok
-            and not any(
-                marker in normalized
-                for marker in ("not logged in", "not authenticated", "unauthenticated", "logged out")
-            )
-            and not denied
-        )
+        return is_auth_output_healthy(auth_ok, status)
 
     async def _probe_cli(self, container: AgentContainer) -> EndpointCapability:
         executable = shutil.which(container.provider)
@@ -244,24 +319,20 @@ class AgentGenerator:
                 version = output.splitlines()[0][:200]
             if container.provider == "agy":
                 healthy = version_ok
-            else:
+            elif container.provider == "gemini":
+                healthy = version_ok and _has_gemini_auth()
+            elif container.provider == "copilot":
+                if version_ok:
+                    if has_copilot_local_auth():
+                        healthy = True
+                    else:
+                        gh_exe = shutil.which("gh")
+                        if gh_exe:
+                            gh_ok, gh_status = await self._command(gh_exe, "auth", "status")
+                            healthy = self._is_auth_output_healthy(gh_ok, gh_status)
+            elif container.provider in _AUTH_COMMANDS:
                 auth_ok, status = await self._command(executable, *_AUTH_COMMANDS[container.provider])
-                cli_healthy = self._is_auth_output_healthy(auth_ok, status)
-                if container.provider == "copilot" and not cli_healthy:
-                    gh_exe = shutil.which("gh")
-                    if gh_exe:
-                        gh_ok, gh_status = await self._command(gh_exe, "auth", "status")
-                        if self._is_auth_output_healthy(gh_ok, gh_status):
-                            cli_healthy = True
-                if container.provider == "gemini":
-                    healthy = version_ok and _has_gemini_auth()
-                else:
-                    healthy = version_ok and cli_healthy
-        elif container.provider == "copilot":
-            gh_exe = shutil.which("gh")
-            if gh_exe:
-                gh_ok, gh_status = await self._command(gh_exe, "auth", "status")
-                healthy = self._is_auth_output_healthy(gh_ok, gh_status)
+                healthy = version_ok and self._is_auth_output_healthy(auth_ok, status)
         baseline_model, context, strengths, weaknesses = _CLI_BASELINES[container.provider]
         return EndpointCapability(
             provider=container.provider, model_name=container.model or "default", cost_tier="flat_subscription",
@@ -269,13 +340,23 @@ class AgentGenerator:
             strengths=list(dict.fromkeys(container.strengths + strengths)),
             weaknesses=weaknesses + ["Context window is an estimate; verify current provider limits"],
             recommended_roles=[container.role],
-            healthy=healthy, version=version, last_checked=datetime.now(timezone.utc),
+            healthy=healthy, available=healthy, service_provider=container.provider,
+            version=version, last_checked=datetime.now(timezone.utc),
         )
 
+    def _effective_local_root(self) -> str:
+        configured = get_base_url("local")
+        raw = configured if configured else self.local_base_url
+        root = raw.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3]
+        return root
+
     async def _probe_local(self) -> list[str]:
+        root = self._effective_local_root()
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
-                response = await client.get(f"{self.local_base_url}/v1/models")
+                response = await client.get(f"{root}/v1/models")
                 response.raise_for_status()
                 data = response.json().get("data", [])
                 if not isinstance(data, list):
@@ -329,7 +410,7 @@ class AgentGenerator:
         for finding in self.research_findings:
             text = f"{finding['title']}\n{finding['content']}"
             lower = text.lower()
-            mentioned = {provider for provider in _AUTH_COMMANDS if re.search(
+            mentioned = {provider for provider in _CLI_BASELINES if re.search(
                 rf"\b{re.escape(provider)}\b", lower
             )}
             if capability.provider not in mentioned or len(mentioned) != 1:
@@ -354,6 +435,559 @@ class AgentGenerator:
                     if 0 < tokens <= 100_000_000:
                         capability.max_context_tokens = max(capability.max_context_tokens, tokens)
 
+    async def _discover_cli_via_command_override(self, pid: str) -> DiscoveryResult:
+        """Honor unit-test overrides on `self._command` while producing a DiscoveryResult."""
+        now = datetime.now(timezone.utc)
+        executable = shutil.which(pid)
+        if not executable:
+            specs_map = {
+                "claude": _CLAUDE_CURATED_MODELS,
+                "codex": _CODEX_CURATED_MODELS,
+            }
+            models = [
+                AvailableModel(
+                    provider_id=pid,
+                    model_id=mid,
+                    display_name=lbl,
+                    available=False,
+                    is_llm=True,
+                    context_window=ctx,
+                    discovery_source="curated",
+                    last_checked=now,
+                )
+                for mid, lbl, ctx in specs_map.get(pid, ())
+            ]
+            return DiscoveryResult(
+                provider_id=pid,
+                status="missing_binary",
+                detail=f"{pid} binary not found in PATH",
+                models=models,
+                discovery_status="unverified",
+                checked_at=now,
+            )
+        version_ok, output = await self._command(executable, "--version")
+        version = output.splitlines()[0][:200] if version_ok and output else None
+        healthy = False
+        if pid == "agy":
+            healthy = version_ok
+        elif pid == "gemini":
+            healthy = version_ok and _has_gemini_auth()
+        elif pid == "copilot":
+            if version_ok:
+                if has_copilot_local_auth():
+                    healthy = True
+                else:
+                    gh_exe = shutil.which("gh")
+                    if gh_exe:
+                        gh_ok, gh_status = await self._command(gh_exe, "auth", "status")
+                        healthy = self._is_auth_output_healthy(gh_ok, gh_status)
+        elif pid in _AUTH_COMMANDS:
+            auth_ok, status_out = await self._command(executable, *_AUTH_COMMANDS[pid])
+            healthy = version_ok and self._is_auth_output_healthy(auth_ok, status_out)
+
+        if pid == "agy":
+            models = [
+                AvailableModel(
+                    provider_id="agy",
+                    model_id=slug,
+                    display_name=label,
+                    available=healthy,
+                    is_llm=True,
+                    context_window=1_000_000,
+                    discovery_source="fallback",
+                    last_checked=now,
+                )
+                for slug, label in AgyCliRunner.SUPPORTED_MODEL_SPECS
+            ]
+        else:
+            catalog_map = {
+                "claude": (_CLAUDE_CURATED_MODELS, "curated"),
+                "codex": (_CODEX_CURATED_MODELS, "curated"),
+                "gemini": (_GEMINI_FALLBACK_MODELS, "fallback"),
+                "copilot": (_COPILOT_FALLBACK_MODELS, "fallback"),
+            }
+            specs, source = catalog_map[pid]
+            models = [
+                AvailableModel(
+                    provider_id=pid,
+                    model_id=mid,
+                    display_name=lbl,
+                    available=healthy,
+                    is_llm=True,
+                    context_window=ctx,
+                    discovery_source=source,
+                    last_checked=now,
+                )
+                for mid, lbl, ctx in specs
+            ]
+        return DiscoveryResult(
+            provider_id=pid,
+            status="authenticated" if healthy else "unauthenticated",
+            detail=f"Found at {executable}" if healthy else f"{pid} found at {executable}, but not authenticated",
+            models=models,
+            discovery_status="ok" if healthy else "unverified",
+            version=version,
+            checked_at=now,
+        )
+
+    async def _discover_for_provider(
+        self, provider_id: str, *, vault_creds: dict[str, str] | None = None
+    ) -> DiscoveryResult:
+        pid = provider_id.strip().lower()
+        now = datetime.now(timezone.utc)
+        creds = vault_creds if vault_creds is not None else {}
+
+        if pid == "local":
+            root = self._effective_local_root()
+            v1_url = f"{root}/v1"
+            if "_probe_local" in self.__dict__:
+                model_ids = await self._probe_local()
+                models = [
+                    AvailableModel(
+                        provider_id="local",
+                        model_id=mid,
+                        display_name=mid,
+                        available=True,
+                        is_llm=True,
+                        context_window=0,
+                        discovery_source="live",
+                        last_checked=now,
+                    )
+                    for mid in model_ids
+                ]
+                return DiscoveryResult(
+                    provider_id="local",
+                    status="authenticated" if models else "unreachable",
+                    detail=f"Healthy local endpoint at {v1_url}" if models else f"Local endpoint unreachable at {v1_url}",
+                    models=models,
+                    discovery_status="ok" if models else "error",
+                    base_url=v1_url,
+                    checked_at=now,
+                )
+            return await discover_provider_models("local", base_url=v1_url)
+
+        if pid in _CLI_BASELINES:
+            if "_command" in self.__dict__:
+                return await self._discover_cli_via_command_override(pid)
+            return await discover_provider_models(pid)
+
+        if pid == "groq":
+            key = creds.get("GROQ_API_KEY") or get_vault_credential("GROQ_API_KEY") or ""
+            return await discover_provider_models("groq", api_key=key)
+
+        if pid == "api":
+            key = creds.get("DAGGER_API_KEY") or get_vault_credential("DAGGER_API_KEY") or ""
+            burl = creds.get("DAGGER_API_BASE_URL") if "DAGGER_API_BASE_URL" in creds else get_base_url("api")
+            return await discover_provider_models("api", base_url=burl, api_key=key)
+
+        if pid == "tavily":
+            key = (
+                creds.get("TAVILY_API_KEY")
+                or get_vault_credential("TAVILY_API_KEY")
+                or self.tavily_api_key
+                or ""
+            )
+            return await discover_provider_models("tavily", api_key=key)
+
+        raise ValueError(f"Unknown service provider: {provider_id}")
+
+    async def _sync_provider_discovery(
+        self,
+        result: DiscoveryResult,
+        *,
+        containers_by_id: dict[str, AgentContainer],
+        previous_capabilities: dict[tuple[str, str], EndpointCapability],
+        vault_creds: dict[str, str],
+        export_updated: bool = True,
+    ) -> list[AgentContainer]:
+        """Persist provider_models, sync EndpointCapability rows, and reconcile matching containers."""
+        pid = result.provider_id
+        self.last_discovery[pid] = result
+        await self.db.replace_provider_models(pid, result.models)
+
+        avail_llms = [m for m in result.models if m.available and m.is_llm]
+        updated_containers: list[AgentContainer] = []
+
+        if pid == "groq":
+            has_key = bool(vault_creds.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY", "").strip())
+            if has_key and "groq_fast_router" not in containers_by_id:
+                default_model = avail_llms[0].model_id if avail_llms else "llama-3.3-70b-versatile"
+                preferred = match_available_model("groq", "llama-3.3-70b-versatile", avail_llms)
+                containers_by_id["groq_fast_router"] = AgentContainer(
+                    container_id="groq_fast_router",
+                    name="Groq Fast Router",
+                    provider="api",
+                    base_url=result.base_url or DEFAULT_GROQ_BASE_URL,
+                    model=preferred.model_id if preferred else default_model,
+                    role="fast_router",
+                    cost_tier="metered_api",
+                    allowed_tools=["read", "search"],
+                    strengths=["triage", "routing", "review", "analysis"],
+                    active=True,
+                )
+            for c in list(containers_by_id.values()):
+                if infer_service_provider(c) != "groq":
+                    continue
+                changed = False
+                target_url = result.base_url or DEFAULT_GROQ_BASE_URL
+                if c.base_url != target_url:
+                    c.base_url = target_url
+                    changed = True
+                if avail_llms and match_available_model("groq", c.model, avail_llms) is None:
+                    preferred = match_available_model("groq", "llama-3.3-70b-versatile", avail_llms)
+                    c.model = preferred.model_id if preferred else avail_llms[0].model_id
+                    changed = True
+                c.active = has_key and result.status in ("configured", "authenticated") and (
+                    bool(avail_llms) or result.discovery_status == "unverified"
+                )
+                if changed:
+                    c.version += 1
+                updated_containers.append(c)
+
+            if result.models:
+                for m in result.models:
+                    await self.db.upsert_capability(
+                        EndpointCapability(
+                            provider="api",
+                            model_name=m.model_id,
+                            cost_tier="metered_api",
+                            max_context_tokens=m.context_window,
+                            strengths=["triage", "routing", "review", "analysis"] if m.is_llm else [],
+                            recommended_roles=["fast_router"] if m.is_llm else [],
+                            healthy=m.available,
+                            available=m.available,
+                            service_provider="groq",
+                            display_name=m.display_name,
+                            is_llm=m.is_llm,
+                            discovery_source=m.discovery_source,
+                            last_checked=result.checked_at,
+                        )
+                    )
+            else:
+                for cap in await self.db.list_capabilities():
+                    if cap.service_provider == "groq":
+                        cap.healthy = False
+                        cap.available = False
+                        cap.last_checked = result.checked_at
+                        await self.db.upsert_capability(cap)
+
+        elif pid == "api":
+            has_key = bool(vault_creds.get("DAGGER_API_KEY") or os.environ.get("DAGGER_API_KEY", "").strip())
+            if has_key and "custom_api_agent" not in containers_by_id:
+                default_model = (
+                    avail_llms[0].model_id
+                    if avail_llms
+                    else os.getenv("DAGGER_API_MODEL", "gpt-4o-mini")
+                )
+                containers_by_id["custom_api_agent"] = AgentContainer(
+                    container_id="custom_api_agent",
+                    name="Custom API Agent",
+                    provider="api",
+                    model=default_model,
+                    base_url=result.base_url,
+                    role="worker",
+                    cost_tier="metered_api",
+                    allowed_tools=["read", "search", "write", "edit"],
+                    strengths=["coding", "analysis"],
+                    active=True,
+                )
+            for c in list(containers_by_id.values()):
+                if infer_service_provider(c) != "api":
+                    continue
+                changed = False
+                if c.container_id == "custom_api_agent" and c.base_url != result.base_url:
+                    c.base_url = result.base_url
+                    changed = True
+                if avail_llms and match_available_model("api", c.model, avail_llms) is None:
+                    c.model = avail_llms[0].model_id
+                    changed = True
+                c.active = has_key and result.status in ("configured", "authenticated")
+                if changed:
+                    c.version += 1
+                updated_containers.append(c)
+
+            if result.models:
+                for m in result.models:
+                    await self.db.upsert_capability(
+                        EndpointCapability(
+                            provider="api",
+                            model_name=m.model_id,
+                            cost_tier="metered_api",
+                            max_context_tokens=m.context_window,
+                            strengths=["coding", "analysis"],
+                            recommended_roles=["worker"],
+                            healthy=m.available,
+                            available=m.available,
+                            service_provider="api",
+                            display_name=m.display_name,
+                            is_llm=m.is_llm,
+                            discovery_source=m.discovery_source,
+                            last_checked=result.checked_at,
+                        )
+                    )
+            elif has_key and result.status == "configured" and "custom_api_agent" in containers_by_id:
+                c = containers_by_id["custom_api_agent"]
+                await self.db.upsert_capability(
+                    EndpointCapability(
+                        provider="api",
+                        model_name=c.model or "gpt-4o-mini",
+                        cost_tier="metered_api",
+                        strengths=c.strengths,
+                        recommended_roles=[c.role],
+                        healthy=True,
+                        available=True,
+                        service_provider="api",
+                        is_llm=True,
+                        discovery_source="static",
+                        last_checked=result.checked_at,
+                    )
+                )
+            else:
+                for cap in await self.db.list_capabilities():
+                    if cap.service_provider == "api":
+                        cap.healthy = False
+                        cap.available = False
+                        cap.last_checked = result.checked_at
+                        await self.db.upsert_capability(cap)
+
+        elif pid == "tavily":
+            has_key = bool(
+                vault_creds.get("TAVILY_API_KEY")
+                or os.environ.get("TAVILY_API_KEY", "").strip()
+                or self.tavily_api_key
+            )
+            if has_key and "tavily_researcher" not in containers_by_id:
+                containers_by_id["tavily_researcher"] = AgentContainer(
+                    container_id="tavily_researcher",
+                    name="Tavily Researcher",
+                    provider="api",
+                    model="tavily-search",
+                    role="researcher",
+                    cost_tier="metered_api",
+                    allowed_tools=["search"],
+                    strengths=["web_search", "research", "discovery"],
+                    active=True,
+                )
+            for c in list(containers_by_id.values()):
+                if infer_service_provider(c) != "tavily":
+                    continue
+                c.active = has_key and result.status == "configured"
+                updated_containers.append(c)
+            if has_key:
+                await self.db.upsert_capability(
+                    EndpointCapability(
+                        provider="api",
+                        model_name="tavily-search",
+                        cost_tier="metered_api",
+                        strengths=["web_search", "research", "discovery"],
+                        recommended_roles=["researcher"],
+                        healthy=True,
+                        available=True,
+                        service_provider="tavily",
+                        display_name="Tavily Search",
+                        is_llm=False,
+                        discovery_source="static",
+                        last_checked=result.checked_at,
+                    )
+                )
+            else:
+                for cap in await self.db.list_capabilities():
+                    if cap.service_provider == "tavily":
+                        cap.healthy = False
+                        cap.available = False
+                        cap.last_checked = result.checked_at
+                        await self.db.upsert_capability(cap)
+
+        elif pid == "local":
+            local_model_ids = [m.model_id for m in result.models if m.available]
+            base_url = result.base_url or f"{self._effective_local_root()}/v1"
+            local_containers = [
+                c for c in containers_by_id.values() if infer_service_provider(c) == "local"
+            ]
+            for local in local_containers:
+                changed = False
+                if local_model_ids and local.model not in local_model_ids:
+                    local.model = local_model_ids[0]
+                    changed = True
+                if local.base_url != base_url:
+                    local.base_url = base_url
+                    changed = True
+                if changed:
+                    local.version += 1
+                local.active = bool(local_model_ids)
+                updated_containers.append(local)
+
+            primary_local = containers_by_id.get("local_triage") or (local_containers[0] if local_containers else None)
+            if local_model_ids:
+                for m in result.models:
+                    await self.db.upsert_capability(
+                        EndpointCapability(
+                            provider="api",
+                            model_name=m.model_id,
+                            cost_tier="local_free",
+                            max_context_tokens=m.context_window,
+                            strengths=primary_local.strengths if primary_local else ["triage", "classification"],
+                            recommended_roles=[primary_local.role] if primary_local else ["triage"],
+                            healthy=m.available,
+                            available=m.available,
+                            service_provider="local",
+                            display_name=m.display_name,
+                            is_llm=m.is_llm,
+                            discovery_source=m.discovery_source,
+                            last_checked=result.checked_at,
+                        )
+                    )
+            elif primary_local is not None:
+                await self.db.upsert_capability(
+                    EndpointCapability(
+                        provider="api",
+                        model_name=primary_local.model or "local",
+                        cost_tier="local_free",
+                        strengths=primary_local.strengths,
+                        recommended_roles=[primary_local.role],
+                        healthy=False,
+                        available=False,
+                        service_provider="local",
+                        is_llm=True,
+                        discovery_source="live",
+                        last_checked=result.checked_at,
+                    )
+                )
+            for cap in await self.db.list_capabilities():
+                if (
+                    cap.provider == "api"
+                    and cap.cost_tier == "local_free"
+                    and cap.model_name not in local_model_ids
+                ):
+                    cap.healthy = False
+                    cap.available = False
+                    cap.service_provider = "local"
+                    cap.last_checked = result.checked_at
+                    await self.db.upsert_capability(cap)
+
+        elif pid in _CLI_BASELINES:
+            baseline_model, baseline_ctx, baseline_strengths, baseline_weaknesses = _CLI_BASELINES[pid]
+            cli_authed = result.status == "authenticated"
+            matching_containers = [
+                c for c in containers_by_id.values() if infer_service_provider(c) == pid
+            ]
+            for c in matching_containers:
+                if (
+                    cli_authed
+                    and result.discovery_status == "ok"
+                    and avail_llms
+                    and c.model
+                    and match_available_model(pid, c.model, avail_llms) is None
+                ):
+                    replacement = (
+                        _pick_lighter_available_model(pid, c.model, avail_llms)
+                        if "fast" in c.role.lower()
+                        else avail_llms[0]
+                    )
+                    if replacement is not None:
+                        c.model = replacement.model_id
+                        c.version += 1
+                c.active = cli_authed
+                updated_containers.append(c)
+
+                model_name = c.model or "default"
+                matched = match_available_model(pid, model_name, result.models)
+                cap_available = matched.available if matched is not None else cli_authed
+                cap = EndpointCapability(
+                    provider=c.provider,
+                    model_name=model_name,
+                    cost_tier="flat_subscription",
+                    max_context_tokens=(
+                        matched.context_window
+                        if matched and matched.context_window > 0
+                        else (baseline_ctx if model_name == baseline_model else 0)
+                    ),
+                    strengths=list(dict.fromkeys(c.strengths + baseline_strengths)),
+                    weaknesses=baseline_weaknesses + ["Context window is an estimate; verify current provider limits"],
+                    recommended_roles=[c.role],
+                    healthy=cli_authed and cap_available,
+                    available=cli_authed and cap_available,
+                    service_provider=pid,
+                    display_name=matched.display_name if matched else None,
+                    is_llm=True,
+                    discovery_source=matched.discovery_source if matched else "static",
+                    version=result.version,
+                    last_checked=result.checked_at,
+                )
+                prev = previous_capabilities.get((cap.provider, cap.model_name))
+                if prev:
+                    cap.max_context_tokens = max(prev.max_context_tokens, cap.max_context_tokens)
+                    cap.strengths = list(dict.fromkeys(cap.strengths + prev.strengths))
+                    cap.weaknesses = prev.weaknesses.copy()
+                self._apply_research(cap)
+                await self.db.upsert_capability(cap)
+
+            # Also record discovered models in endpoint_capabilities when not already written above.
+            written_names = {(c.model or "default") for c in matching_containers}
+            for m in result.models:
+                if m.model_id in written_names or (m.display_name and m.display_name in written_names):
+                    continue
+                cap = EndpointCapability(
+                    provider=pid,
+                    model_name=m.model_id,
+                    cost_tier="flat_subscription",
+                    max_context_tokens=m.context_window or baseline_ctx,
+                    strengths=list(baseline_strengths),
+                    weaknesses=list(baseline_weaknesses),
+                    recommended_roles=[],
+                    healthy=m.available,
+                    available=m.available,
+                    service_provider=pid,
+                    display_name=m.display_name,
+                    is_llm=m.is_llm,
+                    discovery_source=m.discovery_source,
+                    version=result.version,
+                    last_checked=result.checked_at,
+                )
+                prev = previous_capabilities.get((cap.provider, cap.model_name))
+                if prev:
+                    cap.max_context_tokens = max(prev.max_context_tokens, cap.max_context_tokens)
+                    cap.strengths = list(dict.fromkeys(cap.strengths + prev.strengths))
+                    cap.weaknesses = prev.weaknesses.copy()
+                self._apply_research(cap)
+                await self.db.upsert_capability(cap)
+
+        if export_updated:
+            for c in updated_containers:
+                await self.db.upsert_container(c)
+                self._export(c)
+        return updated_containers
+
+    async def refresh_provider(self, provider_id: str) -> DiscoveryResult:
+        """Discover models & auth status for a single service provider and persist results."""
+        pid = provider_id.strip().lower()
+        if pid not in SERVICE_PROVIDER_BY_ID:
+            raise ValueError(f"Unknown service provider: {provider_id}")
+        async with self._run_lock:
+            try:
+                vault_creds = load_vault_credentials()
+            except Exception:
+                vault_creds = {}
+            if not self.tavily_api_key and vault_creds.get("TAVILY_API_KEY"):
+                self.tavily_api_key = vault_creds["TAVILY_API_KEY"]
+            containers_by_id = {
+                item.container_id: item.model_copy(deep=True)
+                for item in await self.db.list_containers()
+            }
+            previous_capabilities = {
+                (item.provider, item.model_name): item
+                for item in await self.db.list_capabilities()
+            }
+            result = await self._discover_for_provider(pid, vault_creds=vault_creds)
+            await self._sync_provider_discovery(
+                result,
+                containers_by_id=containers_by_id,
+                previous_capabilities=previous_capabilities,
+                vault_creds=vault_creds,
+                export_updated=True,
+            )
+            return result
+
     async def refresh_catalog(self) -> list[AgentContainer]:
         current_task = asyncio.current_task()
         if current_task:
@@ -367,7 +1001,6 @@ class AgentGenerator:
 
     async def _refresh_catalog(self) -> list[AgentContainer]:
         try:
-            from dagger.vault import load_vault_credentials
             vault_creds = load_vault_credentials()
         except Exception:
             vault_creds = {}
@@ -418,148 +1051,74 @@ class AgentGenerator:
             ):
                 if agy_seed.container_id not in seed_ids:
                     seeds.append(agy_seed)
+
         existing = {item.container_id: item for item in await self.db.list_containers()}
         previous_capabilities = {
             (item.provider, item.model_name): item for item in await self.db.list_capabilities()
         }
-        containers = [existing.get(seed.container_id, seed).model_copy(deep=True) for seed in seeds]
-        container_ids = {c.container_id for c in containers}
+        containers_by_id: dict[str, AgentContainer] = {
+            seed.container_id: existing.get(seed.container_id, seed).model_copy(deep=True)
+            for seed in seeds
+        }
+        # Preserve any user-created / previously registered containers already in DB.
+        for cid, existing_container in existing.items():
+            if cid not in containers_by_id:
+                containers_by_id[cid] = existing_container.model_copy(deep=True)
 
-        if vault_creds.get("GROQ_API_KEY") and "groq_fast_router" not in container_ids:
-            groq_container = existing.get(
-                "groq_fast_router",
-                AgentContainer(
-                    container_id="groq_fast_router",
-                    name="Groq Fast Router",
-                    provider="api",
-                    base_url="https://api.groq.com/openai/v1",
-                    model="llama-3.3-70b-versatile",
-                    role="fast_router",
-                    cost_tier="metered_api",
-                    allowed_tools=["read", "search"],
-                    strengths=["triage", "routing", "review", "analysis"],
-                    active=True,
+        cli_probe_overridden = "_probe_cli" in self.__dict__
+        if cli_probe_overridden:
+            # Backward compatibility for tests monkeypatching generator._probe_cli directly.
+            cli_containers = [c for c in containers_by_id.values() if c.provider in _CLI_BASELINES]
+            non_cli_ids = [
+                meta["provider_id"]
+                for meta in SERVICE_PROVIDER_METADATA
+                if meta["provider_id"] not in _CLI_BASELINES
+            ]
+            cli_caps, non_cli_results, self.research_findings = await asyncio.gather(
+                asyncio.gather(*(self._probe_cli(c) for c in cli_containers)),
+                asyncio.gather(
+                    *(self._discover_for_provider(pid, vault_creds=vault_creds) for pid in non_cli_ids)
                 ),
-            ).model_copy(deep=True)
-            containers.append(groq_container)
-            container_ids.add("groq_fast_router")
-            await self.db.upsert_capability(EndpointCapability(
-                provider="api",
-                model_name=groq_container.model,
-                cost_tier="metered_api",
-                strengths=groq_container.strengths,
-                recommended_roles=[groq_container.role],
-                healthy=True,
-                last_checked=datetime.now(timezone.utc),
-            ))
+                self.discover_web(),
+            )
+            cli_health: dict[str, bool] = {}
+            for capability in cli_caps:
+                cli_health[capability.provider] = capability.healthy
+                previous = previous_capabilities.get((capability.provider, capability.model_name))
+                if previous:
+                    capability.max_context_tokens = previous.max_context_tokens
+                    capability.strengths = list(dict.fromkeys(capability.strengths + previous.strengths))
+                    capability.weaknesses = previous.weaknesses.copy()
+                self._apply_research(capability)
+                await self.db.upsert_capability(capability)
+            for c in cli_containers:
+                c.active = bool(cli_health.get(c.provider, False))
+            for result in non_cli_results:
+                await self._sync_provider_discovery(
+                    result,
+                    containers_by_id=containers_by_id,
+                    previous_capabilities=previous_capabilities,
+                    vault_creds=vault_creds,
+                    export_updated=False,
+                )
+        else:
+            provider_ids = [meta["provider_id"] for meta in SERVICE_PROVIDER_METADATA]
+            discovery_results, self.research_findings = await asyncio.gather(
+                asyncio.gather(
+                    *(self._discover_for_provider(pid, vault_creds=vault_creds) for pid in provider_ids)
+                ),
+                self.discover_web(),
+            )
+            for result in discovery_results:
+                await self._sync_provider_discovery(
+                    result,
+                    containers_by_id=containers_by_id,
+                    previous_capabilities=previous_capabilities,
+                    vault_creds=vault_creds,
+                    export_updated=False,
+                )
 
-        if vault_creds.get("TAVILY_API_KEY") and "tavily_researcher" not in container_ids:
-            tavily_container = existing.get(
-                "tavily_researcher",
-                AgentContainer(
-                    container_id="tavily_researcher",
-                    name="Tavily Researcher",
-                    provider="api",
-                    model="tavily-search",
-                    role="researcher",
-                    cost_tier="metered_api",
-                    allowed_tools=["search"],
-                    strengths=["web_search", "research", "discovery"],
-                    active=True,
-                ),
-            ).model_copy(deep=True)
-            containers.append(tavily_container)
-            container_ids.add("tavily_researcher")
-            await self.db.upsert_capability(EndpointCapability(
-                provider="api",
-                model_name=tavily_container.model,
-                cost_tier="metered_api",
-                strengths=tavily_container.strengths,
-                recommended_roles=[tavily_container.role],
-                healthy=True,
-                last_checked=datetime.now(timezone.utc),
-            ))
-
-        if vault_creds.get("DAGGER_API_KEY") and "custom_api_agent" not in container_ids:
-            custom_container = existing.get(
-                "custom_api_agent",
-                AgentContainer(
-                    container_id="custom_api_agent",
-                    name="Custom API Agent",
-                    provider="api",
-                    model=os.getenv("DAGGER_API_MODEL", "gpt-4o-mini"),
-                    base_url=vault_creds.get("DAGGER_API_BASE_URL"),
-                    role="worker",
-                    cost_tier="metered_api",
-                    allowed_tools=["read", "search", "write", "edit"],
-                    strengths=["coding", "analysis"],
-                    active=True,
-                ),
-            ).model_copy(deep=True)
-            containers.append(custom_container)
-            container_ids.add("custom_api_agent")
-            await self.db.upsert_capability(EndpointCapability(
-                provider="api",
-                model_name=custom_container.model,
-                cost_tier="metered_api",
-                strengths=custom_container.strengths,
-                recommended_roles=[custom_container.role],
-                healthy=True,
-                last_checked=datetime.now(timezone.utc),
-            ))
-        cli_containers = [item for item in containers if item.provider in _CLI_BASELINES]
-        cli_capabilities, models, self.research_findings = await asyncio.gather(
-            asyncio.gather(*(self._probe_cli(item) for item in cli_containers)),
-            self._probe_local(), self.discover_web(),
-        )
-        cli_health: dict[str, bool] = {}
-        for capability in cli_capabilities:
-            cli_health[capability.provider] = capability.healthy
-            previous = previous_capabilities.get((capability.provider, capability.model_name))
-            if previous:
-                capability.max_context_tokens = previous.max_context_tokens
-                capability.strengths = list(dict.fromkeys(capability.strengths + previous.strengths))
-                capability.weaknesses = previous.weaknesses.copy()
-            self._apply_research(capability)
-            await self.db.upsert_capability(capability)
-        local = next((item for item in containers if item.container_id == "local_triage"), None)
-        if local:
-            changed = False
-            if models and local.model not in models:
-                local.model = models[0]
-                changed = True
-            base_url = f"{self.local_base_url}/v1"
-            if local.base_url != base_url:
-                local.base_url = base_url
-                changed = True
-            if changed:
-                local.version += 1
-            for model in models or [local.model or "local"]:
-                await self.db.upsert_capability(EndpointCapability(
-                    provider="api", model_name=model, cost_tier="local_free",
-                    strengths=local.strengths, recommended_roles=[local.role],
-                    healthy=model in models,
-                ))
-            for capability in await self.db.list_capabilities():
-                if capability.provider == "api" and capability.cost_tier == "local_free" and capability.model_name not in models:
-                    capability.healthy = False
-                    capability.last_checked = datetime.now(timezone.utc)
-                    await self.db.upsert_capability(capability)
-        for container in containers:
-            if container.cost_tier == "local_free":
-                container.active = bool(models)
-            elif container.provider in _CLI_BASELINES:
-                container.active = bool(cli_health.get(container.provider, False))
-            elif container.provider in ("api", "groq", "tavily"):
-                cid = container.container_id.lower()
-                burl = (container.base_url or "").lower()
-                if container.provider == "groq" or "groq" in cid or "groq.com" in burl:
-                    req_key = "GROQ_API_KEY"
-                elif container.provider == "tavily" or "tavily" in cid:
-                    req_key = "TAVILY_API_KEY"
-                else:
-                    req_key = "DAGGER_API_KEY"
-                container.active = bool(vault_creds.get(req_key) or os.environ.get(req_key, "").strip())
+        for container in containers_by_id.values():
             await self.db.upsert_container(container)
             self._export(container)
         return await self.db.list_containers()
@@ -568,15 +1127,20 @@ class AgentGenerator:
         return await self.refresh_catalog()
 
     @staticmethod
-    def _rolodex_entry(container: AgentContainer) -> dict:
+    def _rolodex_entry(
+        container: AgentContainer,
+        *,
+        downshift_suggestion: str | None = None,
+    ) -> dict[str, Any]:
         cost_rank = _COST_RANK_BY_TIER.get(container.cost_tier, 2)
         skills = list(container.strengths[:4]) if container.strengths else [container.role]
         skills_str = ",".join(skills)
         model_label = container.model or "default"
         line = f"{container.container_id} | {container.provider}:{model_label} | {container.cost_tier} | r{cost_rank} | {skills_str}"
-        return {
+        entry: dict[str, Any] = {
             "container_id": container.container_id,
             "provider": container.provider,
+            "service_provider": infer_service_provider(container),
             "model": model_label,
             "role": container.role,
             "cost_tier": container.cost_tier,
@@ -585,14 +1149,31 @@ class AgentGenerator:
             "active": container.active,
             "line": line,
         }
+        if downshift_suggestion is not None:
+            entry["downshift_suggestion"] = downshift_suggestion
+        return entry
 
     async def get_rolodex(self, active_only: bool = True) -> list[dict]:
         containers = await self.db.list_containers()
-        entries = [
-            self._rolodex_entry(c)
-            for c in containers
-            if not active_only or c.active
-        ]
+        models_by_provider: dict[str, list[AvailableModel]] = {}
+        if hasattr(self.db, "list_provider_models"):
+            for item in await self.db.list_provider_models(available_only=True, llm_only=True):
+                models_by_provider.setdefault(item.provider_id, []).append(item)
+
+        entries = []
+        for c in containers:
+            if active_only and not c.active:
+                continue
+            sp = infer_service_provider(c)
+            avail_llms = models_by_provider.get(sp, [])
+            suggestion: str | None = None
+            if avail_llms:
+                lighter = _pick_lighter_available_model(sp, c.model, avail_llms)
+                current_match = match_available_model(sp, c.model, avail_llms)
+                current_id = current_match.model_id.lower() if current_match else (c.model or "").lower()
+                if lighter is not None and lighter.model_id.lower() != current_id:
+                    suggestion = lighter.model_id
+            entries.append(self._rolodex_entry(c, downshift_suggestion=suggestion))
         entries.sort(key=lambda e: (e["cost_rank"], e["container_id"]))
         return entries
 
@@ -621,10 +1202,12 @@ class AgentGenerator:
         container = containers.get(container_id)
         if container is None:
             raise ValueError(f"unknown container: {container_id}")
-        updates: dict = {"version": container.version + 1}
+        updates: dict[str, Any] = {"version": container.version + 1}
         new_model = target_model
+        effective_container = container
         if target_container_id and target_container_id in containers:
             target = containers[target_container_id]
+            effective_container = target
             if not new_model:
                 new_model = target.model
             if (
@@ -635,12 +1218,39 @@ class AgentGenerator:
                 updates["cost_tier"] = target.cost_tier
                 updates["base_url"] = target.base_url
                 updates["api_key_env"] = target.api_key_env
-        if not new_model:
-            is_groq = container.provider == "groq" or bool(
-                container.base_url and "groq.com" in container.base_url
+
+        service_provider = infer_service_provider(effective_container)
+        available_llms: list[AvailableModel] = []
+        if hasattr(self.db, "list_provider_models"):
+            available_llms = await self.db.list_provider_models(
+                service_provider, available_only=True, llm_only=True
             )
-            default_key = "groq" if is_groq else container.provider
-            new_model = _DOWNSHIFT_DEFAULTS.get(default_key, "gpt-4o-mini")
+
+        if target_model is not None and target_model.strip():
+            if available_llms:
+                matched = match_available_model(service_provider, target_model, available_llms)
+                if matched is None:
+                    raise ValueError(
+                        f"Model {target_model!r} is not available for provider {service_provider!r}"
+                    )
+                new_model = matched.model_id
+            else:
+                new_model = target_model.strip()
+        elif not new_model:
+            if available_llms:
+                picked = _pick_lighter_available_model(
+                    service_provider, effective_container.model, available_llms
+                )
+                assert picked is not None
+                new_model = picked.model_id
+            elif service_provider == "local":
+                if effective_container.model:
+                    new_model = effective_container.model
+                else:
+                    raise ValueError("No available models discovered for provider 'local'")
+            else:
+                new_model = _DOWNSHIFT_DEFAULTS.get(service_provider, "gpt-4o-mini")
+
         updates["model"] = new_model
         updated = container.model_copy(update=updates)
         await self.db.upsert_container(updated)

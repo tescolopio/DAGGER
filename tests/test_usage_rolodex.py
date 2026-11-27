@@ -232,7 +232,7 @@ async def test_pm_decompose_goal_injects_rolodex_text(tmp_path: Path):
 def test_server_provider_status_login_rolodex_downshift_and_usage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     vault_file = tmp_path / "credentials.env"
     monkeypatch.setenv("DAGGER_CREDENTIALS_FILE", str(vault_file))
-    app = create_app(db_path=tmp_path / "dagger.sqlite3")
+    app = create_app(db_path=tmp_path / "dagger.sqlite3", container_dir=tmp_path / "containers")
     with TestClient(app) as client:
         status_resp = client.get("/api/providers/status")
         assert status_resp.status_code == 200
@@ -260,10 +260,19 @@ def test_server_provider_status_login_rolodex_downshift_and_usage(tmp_path: Path
         assert usage_resp.status_code == 200
         assert "subscriptions" in usage_resp.json()
 
-        target_id = data["entries"][0]["container_id"]
-        ds_resp = client.post(f"/api/containers/{target_id}/downshift", json={"target_model": "claude-haiku-4-5"})
+        target_entry = data["entries"][0]
+        target_id = target_entry["container_id"]
+        ds_resp = client.post(f"/api/containers/{target_id}/downshift", json={})
         assert ds_resp.status_code == 200
-        assert ds_resp.json()["container"]["model"] == "claude-haiku-4-5"
+        assert ds_resp.json()["container"]["container_id"] == target_id
+        assert ds_resp.json()["container"]["model"]
+        # Cross-provider model must be rejected when target provider is not claude.
+        if target_entry.get("service_provider", target_entry.get("provider")) != "claude":
+            bad_ds = client.post(
+                f"/api/containers/{target_id}/downshift",
+                json={"target_model": "claude-haiku-4-5"},
+            )
+            assert bad_ds.status_code in (400, 404)
 
         cred_resp = client.post(
             "/api/providers/credentials",
@@ -300,7 +309,7 @@ def test_server_interactive_oauth_login_and_complete(tmp_path: Path, monkeypatch
 
     vault_file = tmp_path / "credentials.env"
     monkeypatch.setenv("DAGGER_CREDENTIALS_FILE", str(vault_file))
-    app = create_app(db_path=tmp_path / "dagger.sqlite3")
+    app = create_app(db_path=tmp_path / "dagger.sqlite3", container_dir=tmp_path / "containers")
 
     class _FakeStream:
         def __init__(self, chunks: list[bytes]):
@@ -725,6 +734,20 @@ async def test_strict_readiness_gating_and_runtime_failover(tmp_path: Path, monk
         )
         await db.upsert_container(primary)
         await db.upsert_container(fallback)
+        from dagger.schema import AvailableModel
+
+        await db.replace_provider_models(
+            "claude",
+            [
+                AvailableModel(
+                    provider_id="claude",
+                    model_id="claude-sonnet-4-5",
+                    available=True,
+                    is_llm=True,
+                    discovery_source="curated",
+                )
+            ],
+        )
 
         class FailingRunner:
             async def run(self, container, envelope, usage_context=None):
@@ -918,28 +941,72 @@ def test_agy_cli_runner_model_and_effort_normalization():
     runner = AgyCliRunner()
 
     cases = [
-        ("Gemini 4 Neon (High)", "Gemini 4 Neon", "high"),
-        ("Gemini 4 Hydrogen (Low)", "Gemini 4 Hydrogen", "low"),
-        ("Claude Sonnet 5.5 (Medium)", "Claude Sonnet 5.5", "medium"),
-        ("Orchestrator (Neon)", "Orchestrator", "neon"),
-        ("gemini-4-hydrogen", "Gemini 4 Hydrogen", "low"),
-        ("gemini-4-neon-high", "Gemini 4 Neon", "high"),
-        ("gemini-3.8-flash-low", "Gemini 3.8 Flash", "low"),
-        ("claude-opus-5-5-high", "Claude Opus 5.5", "high"),
-        ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5", "medium"),
-        ("gpt-oss-120b-medium", "GPT-OSS 120B", "medium"),
-        ("claude-haiku-4-5", "Gemini 4 Hydrogen", "low"),
-        ("gpt-4o-mini", "Gemini 4 Hydrogen", "low"),
-        ("unknown-heavy-model", "Gemini 4 Neon", "high"),
+        ("Gemini 4 Neon (High)", "gemini-4-neon-high"),
+        ("Gemini 4 Neon (XHigh)", "gemini-4-neon-xhigh"),
+        ("Gemini 4 Hydrogen (Low)", "gemini-4-hydrogen-low"),
+        ("Claude Sonnet 5.5 (Medium)", "claude-sonnet-5-5-medium"),
+        ("Orchestrator (Neon)", "gemini-pro-orchestrator-neon"),
+        ("Orchestrator (Carbon)", "gemini-pro-orchestrator"),
+        ("Orchestrator (Argon)", "gemini-pro-orchestrator-argon"),
+        ("gemini-pro-orchestrator", "gemini-pro-orchestrator"),
+        ("gemini-pro-orchestrator-neon", "gemini-pro-orchestrator-neon"),
+        ("gemini-pro-orchestrator-argon", "gemini-pro-orchestrator-argon"),
+        ("Gemini 4 Neon", "gemini-4-neon-high"),
+        ("gemini-4-neon", "gemini-4-neon-high"),
+        ("gemini-4-hydrogen", "gemini-4-hydrogen-low"),
+        ("gemini-4-neon-high", "gemini-4-neon-high"),
+        ("gemini-3.8-flash-low", "gemini-3.8-flash-low"),
+        ("gemini-3-8-flash-high", "gemini-3.8-flash-high"),
+        ("claude-opus-5-5-high", "claude-opus-5-5-high"),
+        ("claude-sonnet-5.5-medium", "claude-sonnet-5-5-medium"),
+        ("gpt-oss-120b-medium", "gpt-oss-120b-medium"),
+        ("claude-haiku-4-5", "gemini-4-hydrogen-low"),
+        ("gpt-4o-mini", "gemini-4-hydrogen-low"),
+        ("fast", "gemini-4-hydrogen-low"),
+        ("flash", "gemini-4-hydrogen-low"),
+        ("unknown-heavy-model", "gemini-4-neon-high"),
+        (None, "gemini-4-neon-high"),
     ]
-    for raw_model, expected_model, expected_effort in cases:
+    for raw_model, expected_model in cases:
+        assert expected_model in AgyCliRunner.SUPPORTED_MODELS
+        assert runner.normalize_model_and_effort(raw_model) == (expected_model, None)
         container = AgentContainer(
             name="agy_test", role="fast_auditor", provider="agy", model=raw_model
         )
         args = runner.arguments(container, "check", None)
+        assert "--effort" not in args
         assert args == [
-            "agy", "-p", "check", "--model", expected_model, "--effort", expected_effort
+            "agy", "-p", "check", "--model", expected_model, "--disable-slash-commands"
         ], f"Failed for {raw_model}: {args}"
+
+    # Read-only container enforces --mode plan and never passes --effort.
+    ro_container = AgentContainer(
+        name="agy_ro",
+        role="repo_auditor",
+        provider="agy",
+        model="Gemini 4 Neon (High)",
+        allowed_tools=["read", "search"],
+    )
+    ro_args = runner.arguments(ro_container, "audit", None)
+    assert ro_args == [
+        "agy", "-p", "audit", "--model", "gemini-4-neon-high", "--disable-slash-commands", "--mode", "plan"
+    ]
+
+    # Swarm container keeps slash commands enabled for `/swarm` and omits --effort.
+    swarm_container = AgentContainer(
+        container_id="agy_swarm_squad",
+        name="Agy Swarm Squad",
+        role="swarm_squad",
+        provider="agy",
+        model="Gemini 4 Neon (High)",
+        allowed_tools=["read", "search", "write", "edit"],
+    )
+    swarm_args = runner.arguments(swarm_container, "build", None)
+    assert "--effort" not in swarm_args
+    assert "--disable-slash-commands" not in swarm_args
+    assert swarm_args[0:2] == ["agy", "-p"]
+    assert swarm_args[2].startswith("/swarm ")
+    assert swarm_args[3:] == ["--model", "gemini-4-neon-high"]
 
 
 async def test_generator_seeds_valid_agy_model_effort_strings(tmp_path):
@@ -959,7 +1026,7 @@ async def test_generator_seeds_valid_agy_model_effort_strings(tmp_path):
 
     # Close the DB on exit: a leaked aiosqlite connection thread keeps the interpreter alive.
     async with DatabaseManager(tmp_path / "test.db") as db:
-        gen = AgentGenerator(db)
+        gen = AgentGenerator(db, export_dir=tmp_path / "containers")
         gen._probe_cli = fake_probe_cli  # type: ignore[method-assign]
         gen._probe_local = no_local_models  # type: ignore[method-assign]
         gen.discover_web = no_web_findings  # type: ignore[method-assign]
@@ -967,4 +1034,119 @@ async def test_generator_seeds_valid_agy_model_effort_strings(tmp_path):
     assert seeds["fast_auditor_agy"].model == "Gemini 4 Hydrogen (Low)"
     assert seeds["repo_auditor_agy"].model == "Gemini 4 Neon (High)"
     assert seeds["agy_swarm_squad"].model == "Gemini 4 Neon (High)"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_excludes_tavily_and_unavailable_discovered_models(tmp_path: Path):
+    from dagger.agents.orchestrator import Orchestrator
+    from dagger.schema import AvailableModel, DefinitionOfDone, MilestoneTask
+
+    async with DatabaseManager(tmp_path / "db.sqlite", seed_path=False) as db:
+        tavily_c = AgentContainer(
+            container_id="tavily_researcher",
+            name="Tavily Researcher",
+            provider="api",
+            model="tavily-search",
+            role="researcher",
+            cost_tier="metered_api",
+            allowed_tools=["search"],
+            strengths=["web_search", "research", "review"],
+            active=True,
+        )
+        stale_gemini = AgentContainer(
+            container_id="fast_auditor_gemini",
+            name="Gemini Fast Auditor",
+            provider="gemini",
+            model="gemini-3.8-flash",
+            role="fast_auditor",
+            cost_tier="flat_subscription",
+            allowed_tools=["read", "search"],
+            strengths=["review", "analysis"],
+            active=True,
+        )
+        valid_gemini = AgentContainer(
+            container_id="repo_auditor_gemini",
+            name="Gemini Repo Auditor",
+            provider="gemini",
+            model="gemini-2.5-pro",
+            role="repo_auditor",
+            cost_tier="flat_subscription",
+            allowed_tools=["read", "search"],
+            strengths=["review", "analysis"],
+            active=True,
+        )
+        for c in (tavily_c, stale_gemini, valid_gemini):
+            await db.upsert_container(c)
+        await db.replace_provider_models(
+            "gemini",
+            [
+                AvailableModel(
+                    provider_id="gemini",
+                    model_id="gemini-2.5-pro",
+                    available=True,
+                    is_llm=True,
+                    discovery_source="live",
+                ),
+                AvailableModel(
+                    provider_id="gemini",
+                    model_id="gemini-3.5-flash",
+                    available=True,
+                    is_llm=True,
+                    discovery_source="live",
+                ),
+            ],
+        )
+        await db.replace_provider_models(
+            "tavily",
+            [
+                AvailableModel(
+                    provider_id="tavily",
+                    model_id="tavily-search",
+                    available=True,
+                    is_llm=False,
+                    discovery_source="static",
+                ),
+            ],
+        )
+
+        orch = Orchestrator(db, MagicMock(), tmp_path, bus_path=tmp_path / "bus")
+
+        # Lightweight review milestone must skip BOTH stale gemini-3.8-flash AND tavily_researcher!
+        review_ms = MilestoneTask(
+            milestone_id="m_review",
+            title="Review",
+            description="Review changes",
+            required_skills=["review"],
+            dod=DefinitionOfDone(acceptance_criteria=[], expected_artifacts=[], verification_commands=[]),
+        )
+        selected = await orch.select(review_ms)
+        assert selected.container_id == "repo_auditor_gemini"
+
+        # Explicitly requesting tavily_researcher as an LLM worker must fail closed.
+        tavily_ms = review_ms.model_copy(update={"assigned_container_id": "tavily_researcher"})
+        with pytest.raises(RuntimeError, match="no active matching agent container"):
+            await orch.select(tavily_ms)
+
+        # Failover must NEVER route to tavily_researcher or stale unavailable models.
+        called: list[str] = []
+
+        class FailingRunner:
+            async def run(self, container, envelope, usage_context=None):
+                called.append(container.container_id)
+                raise RuntimeError("primary failed")
+
+        orch.registry = type("Reg", (), {"get": lambda _s, _p: FailingRunner()})()
+        orch._emit = AsyncMock()
+        orch._update_milestone = AsyncMock()
+        env = TaskEnvelope(
+            task_id="t_fail",
+            run_id="r_fail",
+            kanban_id="k_fail",
+            container_id="repo_auditor_gemini",
+            prompt="audit",
+            dod=DefinitionOfDone(acceptance_criteria=[], expected_artifacts=[], verification_commands=[]),
+        )
+        with pytest.raises(RuntimeError, match="primary failed"):
+            await orch._run_provider(valid_gemini, env)
+        assert called == ["repo_auditor_gemini"]
 

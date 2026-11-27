@@ -1,10 +1,23 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import {
-  Activity, ArrowDownRight, Bot, KeyRound, LogIn, RefreshCw, Search, ShieldCheck, X,
+  Activity,
+  AlertTriangle,
+  ArrowDownRight,
+  Bot,
+  Check,
+  Globe,
+  KeyRound,
+  LogIn,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+  Wrench,
+  X,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
   Agent,
+  AvailableModel,
   Capability,
   ProviderLoginResponse,
   ProviderStatus,
@@ -21,24 +34,116 @@ interface ContainerRegistryProps {
   rolodex: RolodexEntry[];
   skills: SkillSummary[];
   skillSources?: Record<string, number>;
-  onRefresh: () => void;
+  onReload: () => Promise<void>;
+  onRefreshRegistry: () => Promise<void>;
+}
+
+interface ConfigModalState {
+  provider: string;
+  displayName: string;
+  supportsApiKey: boolean;
+  supportsBaseUrl: boolean;
+  requiresApiKey: boolean;
+  existingBaseUrl: string;
+  isTool: boolean;
 }
 
 const STATUS_DOT: Record<string, string> = {
   authenticated: 'green',
+  configured: 'green',
   api_key_configured: 'green',
   expired: 'yellow',
+  unauthenticated: 'muted',
   unconfigured: 'muted',
   missing_binary: 'red',
+  unreachable: 'red',
+  error: 'red',
 };
 
 const STATUS_LABEL: Record<string, string> = {
   authenticated: 'Authenticated',
-  api_key_configured: 'API Key Configured',
+  configured: 'Configured',
+  api_key_configured: 'Configured',
   expired: 'Expired',
+  unauthenticated: 'Unauthenticated',
   unconfigured: 'Unconfigured',
   missing_binary: 'Missing Binary',
+  unreachable: 'Unreachable',
+  error: 'Error',
 };
+
+const MAX_VISIBLE_PROVIDER_MODELS = 4;
+
+function stripAnsi(text: string): string {
+  // Strip ANSI escape sequences (CSI and OSC) emitted by provider CLIs.
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\u001b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001b\\))/g, '');
+}
+
+function isConfiguredStatus(status: string): boolean {
+  return status === 'authenticated' || status === 'configured' || status === 'api_key_configured';
+}
+
+function formatTimestamp(ts?: string | null): string {
+  if (!ts) return '';
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function isToolProvider(p: ProviderStatus): boolean {
+  return p.category === 'tool' || p.provider_id.toLowerCase() === 'tavily';
+}
+
+function countAvailableLlmModels(
+  models?: AvailableModel[] | null,
+  fallbackCount?: number,
+): number | undefined {
+  if (Array.isArray(models)) {
+    return models.filter(m => m.available && m.is_llm !== false).length;
+  }
+  return fallbackCount;
+}
+
+function resolveServiceProvider(item: {
+  provider: string;
+  service_provider?: string | null;
+  container_id?: string;
+  base_url?: string | null;
+  model?: string | null;
+  cost_tier?: string | null;
+}): string {
+  if (item.service_provider && item.service_provider.trim()) {
+    return item.service_provider.trim().toLowerCase();
+  }
+  const provider = (item.provider || '').trim().toLowerCase();
+  if (provider !== 'api') return provider;
+  const cid = (item.container_id || '').trim().toLowerCase();
+  const burl = (item.base_url || '').trim().toLowerCase();
+  const model = (item.model || '').trim().toLowerCase();
+  if (cid.includes('groq') || burl.includes('groq.com')) return 'groq';
+  if (cid.includes('tavily') || model === 'tavily-search') return 'tavily';
+  if (item.cost_tier === 'local_free' || cid === 'local_triage') return 'local';
+  if (burl) {
+    try {
+      const host = new URL(burl).hostname.toLowerCase();
+      if (
+        (host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]') &&
+        !cid.includes('custom')
+      ) {
+        return 'local';
+      }
+    } catch {
+      // Ignore malformed URLs during display inference.
+    }
+  }
+  return 'api';
+}
 
 export default function ContainerRegistry({
   agents,
@@ -48,39 +153,207 @@ export default function ContainerRegistry({
   rolodex,
   skills,
   skillSources = {},
-  onRefresh,
+  onReload,
+  onRefreshRegistry,
 }: ContainerRegistryProps) {
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const [providerRefreshBusy, setProviderRefreshBusy] = useState<string | null>(null);
   const [loginBusy, setLoginBusy] = useState<string | null>(null);
   const [loginResult, setLoginResult] = useState<ProviderLoginResponse | null>(null);
   const [callbackInput, setCallbackInput] = useState('');
   const [completeBusy, setCompleteBusy] = useState(false);
   const [completeError, setCompleteError] = useState('');
   const [completeSuccess, setCompleteSuccess] = useState('');
-  const [apiKeyModal, setApiKeyModal] = useState<{ provider: string; displayName: string } | null>(null);
+  const [configModal, setConfigModal] = useState<ConfigModalState | null>(null);
   const [apiKeyInput, setApiKeyInput] = useState('');
   const [baseUrlInput, setBaseUrlInput] = useState('');
+  const [modalError, setModalError] = useState('');
   const [keyBusy, setKeyBusy] = useState(false);
   const [actionError, setActionError] = useState('');
   const [downshiftBusy, setDownshiftBusy] = useState<string | null>(null);
   const [toggleBusy, setToggleBusy] = useState<string | null>(null);
+  const [expandedProviders, setExpandedProviders] = useState<Record<string, boolean>>({});
 
   // Rolodex filters
   const [search, setSearch] = useState('');
   const [providerFilter, setProviderFilter] = useState('all');
   const [tierFilter, setTierFilter] = useState('all');
 
+  // Capabilities filters
+  const [capProviderFilter, setCapProviderFilter] = useState('all');
+  const [capAvailFilter, setCapAvailFilter] = useState<'all' | 'available' | 'unavailable'>('all');
+  const capabilitiesRef = useRef<HTMLDivElement | null>(null);
+
   // Skills filters
   const [skillSearch, setSkillSearch] = useState('');
   const [skillSourceFilter, setSkillSourceFilter] = useState<'all' | 'skillforge' | 'dagger_local' | 'workspace'>('all');
 
+  const openConfigModal = (next: ConfigModalState) => {
+    setApiKeyInput('');
+    setBaseUrlInput(next.existingBaseUrl);
+    setModalError('');
+    setActionError('');
+    setConfigModal(next);
+  };
+
+  const closeConfigModal = () => {
+    setConfigModal(null);
+    setApiKeyInput('');
+    setBaseUrlInput('');
+    setModalError('');
+  };
+
+  const openProviderConfigModal = (p: ProviderStatus) => {
+    const pid = p.provider_id.toLowerCase();
+    const supportsBaseUrl = Boolean(p.supports_base_url || pid === 'api' || pid === 'local');
+    const requiresApiKey =
+      p.requires_api_key !== undefined
+        ? p.requires_api_key
+        : Boolean(p.supports_api_key && pid !== 'local');
+    openConfigModal({
+      provider: p.provider_id,
+      displayName: p.display_name,
+      supportsApiKey: p.supports_api_key,
+      supportsBaseUrl,
+      requiresApiKey,
+      existingBaseUrl: p.base_url ?? '',
+      isTool: isToolProvider(p),
+    });
+  };
+
+  const openCustomApiModal = () => {
+    const existing = providers.find(p => p.provider_id.toLowerCase() === 'api');
+    if (existing) {
+      openProviderConfigModal(existing);
+      return;
+    }
+    openConfigModal({
+      provider: 'api',
+      displayName: 'Custom OpenAI-Compatible API',
+      supportsApiKey: true,
+      supportsBaseUrl: true,
+      requiresApiKey: true,
+      existingBaseUrl: '',
+      isTool: false,
+    });
+  };
+
+  const getProviderModels = (p: ProviderStatus): AvailableModel[] => {
+    if (Array.isArray(p.available_models) && (p.available_models.length > 0 || p.discovery_status !== undefined)) {
+      return p.available_models;
+    }
+    const pid = p.provider_id.toLowerCase();
+    return capabilities
+      .filter(cap => {
+        const capProvider = (cap.service_provider || cap.provider).toLowerCase();
+        return capProvider === pid;
+      })
+      .map(cap => ({
+        provider_id: p.provider_id,
+        model_id: cap.model_name,
+        display_name: cap.display_name ?? null,
+        available: cap.available ?? cap.healthy,
+        is_llm: cap.is_llm ?? true,
+        context_window: cap.max_context_tokens,
+        discovery_source: cap.discovery_source,
+        last_checked: cap.last_checked ?? null,
+      }));
+  };
+
+  const modelAvailabilityIndex = useMemo(() => {
+    const availableKeys = new Set<string>();
+    const toolReadyKeys = new Set<string>();
+    const unavailableKeys = new Set<string>();
+    const verifiedProviders = new Set<string>();
+    const providerHealthById = new Map<string, string>();
+    const toolProviderIds = new Set<string>();
+
+    const registerKey = (target: Set<string>, providerKey: string, modelValue?: string | null) => {
+      if (!providerKey || !modelValue) return;
+      const pKey = providerKey.trim().toLowerCase();
+      const mKey = modelValue.trim().toLowerCase();
+      if (!pKey || !mKey) return;
+      target.add(`${pKey}::${mKey}`);
+    };
+
+    for (const p of providers) {
+      const pid = p.provider_id.toLowerCase();
+      providerHealthById.set(pid, p.status);
+      if (isToolProvider(p)) {
+        toolProviderIds.add(pid);
+      }
+      if (
+        p.discovery_status === 'ok' ||
+        p.discovery_status === 'fallback' ||
+        (Array.isArray(p.available_models) && p.available_models.length > 0)
+      ) {
+        verifiedProviders.add(pid);
+      }
+      for (const m of p.available_models ?? []) {
+        const provId = (m.provider_id || pid).toLowerCase();
+        const bucket = !m.available
+          ? unavailableKeys
+          : m.is_llm === false
+            ? toolReadyKeys
+            : availableKeys;
+        registerKey(bucket, provId, m.model_id);
+        if (m.display_name) registerKey(bucket, provId, m.display_name);
+      }
+    }
+
+    for (const cap of capabilities) {
+      const isAvail = cap.available ?? cap.healthy;
+      const pPrimary = (cap.service_provider || cap.provider).toLowerCase();
+      const bucket = !isAvail
+        ? unavailableKeys
+        : cap.is_llm === false
+          ? toolReadyKeys
+          : availableKeys;
+      registerKey(bucket, pPrimary, cap.model_name);
+      if (cap.display_name) {
+        registerKey(bucket, pPrimary, cap.display_name);
+      }
+      verifiedProviders.add(pPrimary);
+    }
+
+    return {
+      availableKeys,
+      toolReadyKeys,
+      unavailableKeys,
+      verifiedProviders,
+      providerHealthById,
+      toolProviderIds,
+    };
+  }, [providers, capabilities]);
+
+  const getModelAvailability = (
+    serviceProvider: string,
+    model?: string | null,
+  ): 'ready' | 'tool_ready' | 'unavailable' | 'unverified' => {
+    const pKey = (serviceProvider || '').trim().toLowerCase();
+    const mKey = (model || '').trim().toLowerCase();
+    if (!pKey || !mKey) return 'unverified';
+    const pair = `${pKey}::${mKey}`;
+    if (modelAvailabilityIndex.toolReadyKeys.has(pair)) return 'tool_ready';
+    if (modelAvailabilityIndex.availableKeys.has(pair)) return 'ready';
+    if (modelAvailabilityIndex.unavailableKeys.has(pair)) return 'unavailable';
+    const provStatus = modelAvailabilityIndex.providerHealthById.get(pKey);
+    if (modelAvailabilityIndex.toolProviderIds.has(pKey)) {
+      if (!provStatus) return 'unverified';
+      return isConfiguredStatus(provStatus) ? 'tool_ready' : 'unavailable';
+    }
+    if (provStatus && !isConfiguredStatus(provStatus)) return 'unavailable';
+    if (modelAvailabilityIndex.verifiedProviders.has(pKey)) return 'unavailable';
+    return 'unverified';
+  };
+
   const skillCounts = useMemo(() => {
-    const counts = {
+    return {
       total: skills.length,
       skillforge: skillSources.skillforge ?? skills.filter(s => s.source === 'skillforge').length,
       dagger_local: skillSources.dagger_local ?? skills.filter(s => s.source === 'dagger_local').length,
       workspace: skillSources.workspace ?? skills.filter(s => s.source === 'workspace').length,
     };
-    return counts;
   }, [skills, skillSources]);
 
   const filteredSkills = useMemo(() => {
@@ -96,6 +369,89 @@ export default function ContainerRegistry({
     });
   }, [skills, skillSearch, skillSourceFilter]);
 
+  const capabilityStats = useMemo(() => {
+    let available = 0;
+    let unavailable = 0;
+    const providerIds = new Set<string>();
+    for (const cap of capabilities) {
+      providerIds.add(cap.service_provider || cap.provider);
+      if (cap.available ?? cap.healthy) available += 1;
+      else unavailable += 1;
+    }
+    return {
+      available,
+      unavailable,
+      providers: [...providerIds].sort(),
+    };
+  }, [capabilities]);
+
+  const filteredCapabilities = useMemo(() => {
+    return capabilities.filter(cap => {
+      const capProv = cap.service_provider || cap.provider;
+      if (capProviderFilter !== 'all' && capProv.toLowerCase() !== capProviderFilter.toLowerCase()) {
+        return false;
+      }
+      const isAvail = cap.available ?? cap.healthy;
+      if (capAvailFilter === 'available' && !isAvail) return false;
+      if (capAvailFilter === 'unavailable' && isAvail) return false;
+      return true;
+    });
+  }, [capabilities, capProviderFilter, capAvailFilter]);
+
+  const jumpToCapabilities = (providerId: string) => {
+    setCapProviderFilter(providerId);
+    setCapAvailFilter('available');
+    capabilitiesRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  const formatDiscoveryBanner = (displayName: string, count?: number, isTool?: boolean, verb = 'Configured') => {
+    if (isTool) {
+      return `${verb} ${displayName} · Search tool ready for agents.`;
+    }
+    if (typeof count === 'number' && count > 0) {
+      return `${verb} ${displayName} · ${count} ${count === 1 ? 'model' : 'models'} available for Agent Builder & Orchestrators.`;
+    }
+    return `${verb} ${displayName}.`;
+  };
+
+  const handleRefreshRegistry = async () => {
+    setRefreshBusy(true);
+    setActionError('');
+    try {
+      await onRefreshRegistry();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not refresh registry.');
+    } finally {
+      setRefreshBusy(false);
+    }
+  };
+
+  const handleRefreshProvider = async (p: ProviderStatus) => {
+    setProviderRefreshBusy(p.provider_id);
+    setActionError('');
+    try {
+      const updated = await api.refreshProvider(p.provider_id);
+      await onReload();
+      if (updated.discovery_error) {
+        setActionError(`${updated.display_name || p.display_name}: ${updated.discovery_error}`);
+      } else {
+        const count = countAvailableLlmModels(updated.available_models, updated.available_model_count);
+        setCompleteSuccess(
+          formatDiscoveryBanner(
+            updated.display_name || p.display_name,
+            count,
+            isToolProvider(updated),
+            'Discovered',
+          ),
+        );
+      }
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : `Could not discover models for ${p.display_name}.`);
+    } finally {
+      setProviderRefreshBusy(null);
+    }
+  };
+
   const handleLogin = async (providerId: string) => {
     setLoginBusy(providerId);
     setLoginResult(null);
@@ -105,8 +461,24 @@ export default function ContainerRegistry({
     setCompleteSuccess('');
     try {
       const res = await api.providerLogin(providerId);
-      setLoginResult(res);
-      onRefresh();
+      if (res.status === 'authenticated' || res.status === 'already_authenticated') {
+        const count = countAvailableLlmModels(
+          res.provider_status?.available_models ?? res.available_models,
+          res.provider_status?.available_model_count,
+        );
+        const displayName =
+          res.provider_status?.display_name ??
+          providers.find(p => p.provider_id === providerId)?.display_name ??
+          providerId;
+        setCompleteSuccess(formatDiscoveryBanner(displayName, count, false, 'Signed in to'));
+        await onReload();
+      } else {
+        setLoginResult(res);
+        // Do NOT run refreshRegistry while waiting for user OAuth callback.
+        if (res.status !== 'awaiting_callback' && res.status !== 'manual_action_required') {
+          await onReload();
+        }
+      }
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Login request failed.');
     } finally {
@@ -114,22 +486,32 @@ export default function ContainerRegistry({
     }
   };
 
-  const handleCompleteLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!loginResult || !callbackInput.trim()) return;
+  const submitLoginCompletion = async (input: string) => {
+    if (!loginResult) return;
     setCompleteBusy(true);
     setCompleteError('');
     setCompleteSuccess('');
     try {
-      const updated = await api.completeProviderLogin(loginResult.provider_id, callbackInput.trim());
-      if (updated.status === 'authenticated' || updated.status === 'api_key_configured') {
+      const updated =
+        loginResult.status === 'manual_action_required' && !input
+          ? await api.refreshProvider(loginResult.provider_id)
+          : await api.completeProviderLogin(loginResult.provider_id, input);
+      if (isConfiguredStatus(updated.status)) {
+        const count = countAvailableLlmModels(updated.available_models, updated.available_model_count);
         setLoginResult(null);
         setCallbackInput('');
-        setCompleteSuccess(`Signed in to ${updated.display_name || updated.provider_id}.`);
+        setCompleteSuccess(
+          formatDiscoveryBanner(
+            updated.display_name || updated.provider_id,
+            count,
+            isToolProvider(updated),
+            'Signed in to',
+          ),
+        );
       } else {
         setCompleteError(updated.detail || `Sign-in did not complete (status: ${updated.status}).`);
       }
-      onRefresh();
+      await onReload();
     } catch (err) {
       setCompleteError(err instanceof Error ? err.message : 'Failed to complete sign-in.');
     } finally {
@@ -137,23 +519,47 @@ export default function ContainerRegistry({
     }
   };
 
-  const handleSaveKey = async (e: React.FormEvent) => {
+  const handleCompleteLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!apiKeyModal || !apiKeyInput.trim()) return;
+    if (!loginResult || !callbackInput.trim()) return;
+    await submitLoginCompletion(callbackInput.trim());
+  };
+
+  const handleSaveConfig = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!configModal) return;
+    const trimmedKey = apiKeyInput.trim();
+    const trimmedUrl = baseUrlInput.trim();
+    if (configModal.requiresApiKey && !trimmedKey) {
+      setModalError('API key is required for this provider.');
+      return;
+    }
+    if (!configModal.requiresApiKey && configModal.supportsBaseUrl && !trimmedUrl && !configModal.existingBaseUrl) {
+      setModalError('Please enter a Base URL for this endpoint.');
+      return;
+    }
+
     setKeyBusy(true);
+    setModalError('');
     setActionError('');
+    setCompleteSuccess('');
     try {
-      await api.saveProviderCredentials(
-        apiKeyModal.provider,
-        apiKeyInput.trim(),
-        apiKeyModal.provider === 'api' ? baseUrlInput.trim() : undefined,
+      const res = await api.saveProviderCredentials(
+        configModal.provider,
+        configModal.supportsApiKey || configModal.requiresApiKey ? trimmedKey : '',
+        configModal.supportsBaseUrl ? trimmedUrl : undefined,
       );
-      setApiKeyModal(null);
-      setApiKeyInput('');
-      setBaseUrlInput('');
-      onRefresh();
+      const count = countAvailableLlmModels(
+        res.provider_status?.available_models ?? res.available_models,
+        res.provider_status?.available_model_count ?? res.available_model_count,
+      );
+      const displayName = configModal.displayName;
+      const isTool = configModal.isTool;
+      closeConfigModal();
+      setCompleteSuccess(formatDiscoveryBanner(displayName, count, isTool, 'Configured'));
+      await onReload();
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Could not save credentials.');
+      setModalError(err instanceof Error ? err.message : 'Could not save credentials.');
     } finally {
       setKeyBusy(false);
     }
@@ -171,7 +577,7 @@ export default function ContainerRegistry({
         target_model: targetModel,
         target_container_id: targetContainerId,
       });
-      onRefresh();
+      await onReload();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Downshift failed.');
     } finally {
@@ -186,7 +592,7 @@ export default function ContainerRegistry({
     setActionError('');
     try {
       await api.toggleAgentActive(agent);
-      onRefresh();
+      await onReload();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not update container status.');
     } finally {
@@ -195,7 +601,7 @@ export default function ContainerRegistry({
   };
 
   const rolodexProviders = useMemo(
-    () => [...new Set(rolodex.map(r => r.provider))].sort(),
+    () => [...new Set(rolodex.map(r => resolveServiceProvider(r)))].sort(),
     [rolodex],
   );
   const rolodexTiers = useMemo(
@@ -206,11 +612,13 @@ export default function ContainerRegistry({
   const filteredRolodex = useMemo(() => {
     const q = search.trim().toLowerCase();
     return rolodex.filter(entry => {
-      if (providerFilter !== 'all' && entry.provider !== providerFilter) return false;
+      const sp = resolveServiceProvider(entry);
+      if (providerFilter !== 'all' && sp !== providerFilter) return false;
       if (tierFilter !== 'all' && entry.cost_tier !== tierFilter) return false;
       if (!q) return true;
       return (
         entry.container_id.toLowerCase().includes(q) ||
+        sp.includes(q) ||
         (entry.model ?? '').toLowerCase().includes(q) ||
         entry.role.toLowerCase().includes(q) ||
         entry.skills.some(s => s.toLowerCase().includes(q))
@@ -222,6 +630,12 @@ export default function ContainerRegistry({
     if (!usage?.metered.daily_trend.length) return 1;
     return Math.max(...usage.metered.daily_trend.map(d => d.cost_usd), 0.0001);
   }, [usage]);
+
+  const saveDisabled =
+    keyBusy ||
+    !configModal ||
+    (configModal.requiresApiKey && !apiKeyInput.trim()) ||
+    (!configModal.requiresApiKey && configModal.supportsBaseUrl && !baseUrlInput.trim() && !configModal.existingBaseUrl);
 
   return (
     <>
@@ -238,28 +652,30 @@ export default function ContainerRegistry({
       <div className="registry-heading">
         <div>
           <h2>Providers &amp; subscriptions</h2>
-          <p>Live authentication status, CLI login, and metered API credentials</p>
+          <p>Register providers, discover available models, and verify readiness for Agent Builder &amp; Orchestrators</p>
         </div>
         <div className="registry-actions-row">
-          <button
-            className="secondary-button"
-            onClick={() => setApiKeyModal({ provider: 'api', displayName: 'Custom OpenAI-Compatible API' })}
-          >
+          <button className="secondary-button" onClick={openCustomApiModal}>
             <KeyRound size={14} /> Custom API Key
           </button>
-          <button className="secondary-button" onClick={onRefresh}>
-            <RefreshCw size={14} /> Refresh registry
+          <button
+            className="secondary-button"
+            disabled={refreshBusy}
+            onClick={() => void handleRefreshRegistry()}
+          >
+            <RefreshCw size={14} className={refreshBusy ? 'spin' : ''} />
+            {refreshBusy ? 'Refreshing…' : 'Refresh registry'}
           </button>
         </div>
       </div>
 
       {completeSuccess && (
-        <div className="panel login-banner">
+        <div className="panel login-banner success-banner">
           <div className="login-banner-body">
-            <strong>Sign-in complete</strong>
+            <strong>Provider ready</strong>
             <span>{completeSuccess}</span>
           </div>
-          <button className="icon-button" aria-label="Dismiss sign-in success" onClick={() => setCompleteSuccess('')}>
+          <button className="icon-button" aria-label="Dismiss provider notice" onClick={() => setCompleteSuccess('')}>
             <X size={15} />
           </button>
         </div>
@@ -267,13 +683,17 @@ export default function ContainerRegistry({
 
       {loginResult && (() => {
         const authUrl = loginResult.auth_url || loginResult.device_url;
+        const awaitingCallback =
+          loginResult.status === 'awaiting_callback' || Boolean(loginResult.requires_callback);
+        const manualAction = loginResult.status === 'manual_action_required';
+        const cleanedMessage = stripAnsi(loginResult.message || '').trim();
         return (
           <div className="panel login-banner">
             <div className="login-banner-body">
               <strong>
-                {loginResult.provider_id} · {loginResult.status}
+                {loginResult.provider_id} · {loginResult.status.replace(/_/g, ' ')}
               </strong>
-              <span>{loginResult.message}</span>
+              {cleanedMessage && <pre className="login-message">{cleanedMessage}</pre>}
               {(authUrl || loginResult.device_code) && (
                 <div className="device-auth-row">
                   {authUrl && (
@@ -291,10 +711,10 @@ export default function ContainerRegistry({
                   )}
                 </div>
               )}
-              {loginResult.status === 'awaiting_callback' && (
+              {awaitingCallback && (
                 <form className="callback-handoff-form" onSubmit={e => void handleCompleteLogin(e)}>
                   <label htmlFor="provider-callback-input">
-                    Paste authorization code or localhost callback URL
+                    Paste authorization code or localhost callback URL (or check status after browser/device sign-in)
                   </label>
                   <div className="callback-handoff-row">
                     <input
@@ -312,9 +732,34 @@ export default function ContainerRegistry({
                     >
                       {completeBusy ? 'Completing…' : 'Complete Sign-In'}
                     </button>
+                    <button
+                      type="button"
+                      className="secondary-button compact-btn"
+                      disabled={completeBusy}
+                      onClick={() => void submitLoginCompletion('')}
+                    >
+                      <Check size={13} />
+                      {completeBusy ? 'Checking…' : 'Check Login Status'}
+                    </button>
                   </div>
                   {completeError && <div className="error-text">{completeError}</div>}
                 </form>
+              )}
+              {manualAction && !awaitingCallback && (
+                <div className="callback-handoff-form">
+                  <div className="callback-handoff-row">
+                    <button
+                      type="button"
+                      className="primary-button compact-btn"
+                      disabled={completeBusy}
+                      onClick={() => void submitLoginCompletion('')}
+                    >
+                      <RefreshCw size={13} className={completeBusy ? 'spin' : ''} />
+                      {completeBusy ? 'Checking…' : 'Check Login Status'}
+                    </button>
+                  </div>
+                  {completeError && <div className="error-text">{completeError}</div>}
+                </div>
               )}
             </div>
             <button
@@ -333,44 +778,185 @@ export default function ContainerRegistry({
       })()}
 
       <div className="provider-grid">
-        {providers.map(p => (
-          <article className="panel provider-card" key={p.provider_id}>
-            <div className="agent-card-top">
-              <div className="provider-title-group">
-                <ShieldCheck size={16} className="provider-shield" />
-                <strong>{p.display_name}</strong>
+        {providers.map(p => {
+          const toolOnly = isToolProvider(p);
+          const models = getProviderModels(p);
+          const availableModels = models.filter(m => m.available && m.is_llm !== false);
+          const availableCount = Array.isArray(p.available_models)
+            ? availableModels.length
+            : (p.available_model_count ?? availableModels.length);
+          const expanded = Boolean(expandedProviders[p.provider_id]);
+          const visibleModels = expanded
+            ? availableModels
+            : availableModels.slice(0, MAX_VISIBLE_PROVIDER_MODELS);
+          const hiddenCount = availableModels.length - visibleModels.length;
+          const canConfigure = Boolean(
+            p.supports_api_key || p.supports_base_url || p.provider_id === 'local' || p.provider_id === 'api',
+          );
+          const isEndpointOnly = Boolean(!p.supports_api_key && (p.supports_base_url || p.provider_id === 'local'));
+          const configured = isConfiguredStatus(p.status);
+          const missingBinary = p.status === 'missing_binary';
+
+          return (
+            <article className="panel provider-card" key={p.provider_id}>
+              <div className="agent-card-top">
+                <div className="provider-title-group">
+                  {toolOnly ? (
+                    <Wrench size={16} className="provider-shield" />
+                  ) : p.kind === 'local' ? (
+                    <Globe size={16} className="provider-shield" />
+                  ) : (
+                    <ShieldCheck size={16} className="provider-shield" />
+                  )}
+                  <strong>{p.display_name}</strong>
+                </div>
+                <span className="pill">
+                  <span className={`status-dot ${STATUS_DOT[p.status] || 'muted'}`} />
+                  {STATUS_LABEL[p.status] || p.status}
+                </span>
               </div>
-              <span className="pill">
-                <span className={`status-dot ${STATUS_DOT[p.status] || 'muted'}`} />
-                {STATUS_LABEL[p.status] || p.status}
-              </span>
-            </div>
-            <div className="provider-detail">{p.detail || p.kind}</div>
-            <div className="provider-card-actions">
-              {p.supports_login && (
-                <button
-                  className="secondary-button compact-btn"
-                  disabled={loginBusy === p.provider_id}
-                  onClick={() => void handleLogin(p.provider_id)}
-                >
-                  <LogIn size={13} />
-                  {loginBusy === p.provider_id ? 'Starting…' : 'Sign In / Re-Auth'}
-                </button>
+
+              <div className="provider-detail">{p.detail || p.kind}</div>
+              {p.base_url && (
+                <div className="provider-base-url" title={p.base_url}>
+                  <code>{p.base_url}</code>
+                </div>
               )}
-              {p.supports_api_key && (
-                <button
-                  className="secondary-button compact-btn"
-                  onClick={() =>
-                    setApiKeyModal({ provider: p.provider_id, displayName: p.display_name })
-                  }
-                >
-                  <KeyRound size={13} />
-                  {p.status === 'api_key_configured' ? 'Update Key' : 'Add API Key'}
-                </button>
-              )}
-            </div>
-          </article>
-        ))}
+
+              <div className="provider-models-block">
+                {toolOnly ? (
+                  <div className="provider-tool-badge">
+                    <Wrench size={11} />
+                    <span>Tool / Search provider</span>
+                  </div>
+                ) : (
+                  <>
+                    <div className="provider-models-header">
+                      {availableCount > 0 ? (
+                        <button
+                          type="button"
+                          className="provider-ready-badge"
+                          onClick={() => jumpToCapabilities(p.provider_id)}
+                          title="Filter Endpoint Capabilities to this provider's available models"
+                        >
+                          <span className="status-dot green" />
+                          {availableCount} available · Builder Ready
+                        </button>
+                      ) : (
+                        <span className="provider-models-empty">
+                          {configured
+                            ? 'No models discovered yet'
+                            : missingBinary
+                              ? 'Install CLI binary on PATH to enable'
+                              : 'Register to discover available models'}
+                        </span>
+                      )}
+                      {p.discovery_status && p.discovery_status !== 'unverified' && (
+                        <span className={`discovery-badge ${p.discovery_status}`}>
+                          {p.discovery_status}
+                        </span>
+                      )}
+                    </div>
+
+                    {p.discovery_error && (
+                      <div className="provider-discovery-warn" role="note">
+                        <AlertTriangle size={12} />
+                        <span>{p.discovery_error}</span>
+                      </div>
+                    )}
+
+                    {availableModels.length > 0 && (
+                      <div className="provider-model-chips">
+                        {visibleModels.map(model => (
+                          <span
+                            key={`${model.provider_id}:${model.model_id}`}
+                            className="provider-model-chip"
+                            title={`${model.model_id}${model.discovery_source ? ` (${model.discovery_source})` : ''}`}
+                          >
+                            {model.display_name || model.model_id}
+                          </span>
+                        ))}
+                        {hiddenCount > 0 && (
+                          <button
+                            type="button"
+                            className="provider-model-more"
+                            onClick={() =>
+                              setExpandedProviders(prev => ({ ...prev, [p.provider_id]: true }))
+                            }
+                          >
+                            +{hiddenCount} more
+                          </button>
+                        )}
+                        {expanded && availableModels.length > MAX_VISIBLE_PROVIDER_MODELS && (
+                          <button
+                            type="button"
+                            className="provider-model-more"
+                            onClick={() =>
+                              setExpandedProviders(prev => ({ ...prev, [p.provider_id]: false }))
+                            }
+                          >
+                            Show less
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+
+              <div className="provider-card-actions">
+                {p.supports_login && (
+                  <button
+                    className="secondary-button compact-btn"
+                    disabled={loginBusy === p.provider_id || missingBinary}
+                    title={
+                      missingBinary
+                        ? `Install the ${p.provider_id} CLI binary on PATH before signing in`
+                        : 'Start interactive CLI sign-in'
+                    }
+                    onClick={() => void handleLogin(p.provider_id)}
+                  >
+                    <LogIn size={13} />
+                    {loginBusy === p.provider_id ? 'Starting…' : 'Sign In / Re-Auth'}
+                  </button>
+                )}
+                {canConfigure && (
+                  <button
+                    className="secondary-button compact-btn"
+                    onClick={() => openProviderConfigModal(p)}
+                  >
+                    {isEndpointOnly ? <Globe size={13} /> : <KeyRound size={13} />}
+                    {isEndpointOnly
+                      ? p.base_url || configured
+                        ? 'Configure Endpoint'
+                        : 'Register Endpoint'
+                      : configured
+                        ? 'Update Key'
+                        : 'Add API Key'}
+                  </button>
+                )}
+                {!missingBinary && (
+                  <button
+                    className="secondary-button compact-btn"
+                    disabled={providerRefreshBusy === p.provider_id}
+                    title={toolOnly ? 'Verify provider configuration' : 'Probe provider and discover available models'}
+                    onClick={() => void handleRefreshProvider(p)}
+                  >
+                    <RefreshCw
+                      size={12}
+                      className={providerRefreshBusy === p.provider_id ? 'spin' : ''}
+                    />
+                    {providerRefreshBusy === p.provider_id
+                      ? 'Probing…'
+                      : toolOnly
+                        ? 'Verify'
+                        : 'Discover Models'}
+                  </button>
+                )}
+              </div>
+            </article>
+          );
+        })}
       </div>
 
       {/* 2. Usage, Quotas & Spend Trend */}
@@ -485,7 +1071,7 @@ export default function ContainerRegistry({
       <div className="registry-heading">
         <div>
           <h2>Agent rolodex</h2>
-          <p>Searchable, filterable container roster with cost rank and skills</p>
+          <p>Searchable, filterable container roster with cost rank, model availability, and skills</p>
         </div>
         <div className="rolodex-filters">
           <div className="search-box">
@@ -539,42 +1125,82 @@ export default function ContainerRegistry({
               </tr>
             </thead>
             <tbody>
-              {filteredRolodex.map(entry => (
-                <tr key={entry.container_id}>
-                  <td>
-                    <strong>{entry.container_id}</strong>
-                    <div className="rolodex-role">{entry.role}</div>
-                  </td>
-                  <td>{entry.provider}</td>
-                  <td>{entry.model || '—'}</td>
-                  <td>
-                    {entry.cost_tier} (#{entry.cost_rank})
-                  </td>
-                  <td>
-                    <div className="tags compact-tags">
-                      {entry.skills.map(s => (
-                        <span key={s}>{s}</span>
-                      ))}
-                    </div>
-                  </td>
-                  <td>
-                    <button
-                      type="button"
-                      className="pill"
-                      disabled={toggleBusy === entry.container_id}
-                      onClick={() => void handleToggleActive(entry.container_id)}
-                      title={entry.active ? 'Click to deactivate' : 'Click to activate'}
-                    >
-                      <span className={`status-dot ${entry.active ? 'green' : 'muted'}`} />
-                      {toggleBusy === entry.container_id
-                        ? 'Saving…'
-                        : entry.active
-                          ? 'Active'
-                          : 'Inactive'}
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {filteredRolodex.map(entry => {
+                const serviceProvider = resolveServiceProvider(entry);
+                const avail = getModelAvailability(serviceProvider, entry.model);
+                const badgeClass = avail === 'tool_ready' ? 'ready' : avail;
+                const dotClass =
+                  avail === 'ready' || avail === 'tool_ready'
+                    ? 'green'
+                    : avail === 'unavailable'
+                      ? 'yellow'
+                      : 'muted';
+                const badgeLabel =
+                  avail === 'tool_ready'
+                    ? 'Tool Ready'
+                    : avail === 'ready'
+                      ? 'Ready'
+                      : avail === 'unavailable'
+                        ? 'Unavailable'
+                        : 'Unverified';
+                return (
+                  <tr key={entry.container_id}>
+                    <td>
+                      <strong>{entry.container_id}</strong>
+                      <div className="rolodex-role">{entry.role}</div>
+                    </td>
+                    <td>{serviceProvider}</td>
+                    <td>
+                      <div className="rolodex-model-cell">
+                        <span>{entry.model || '—'}</span>
+                        {entry.model && (
+                          <span
+                            className={`model-avail-badge ${badgeClass}`}
+                            title={
+                              avail === 'tool_ready'
+                                ? 'Search/tool provider configured and ready for agents'
+                                : avail === 'ready'
+                                  ? 'Model discovered & available for Agent Builder and Orchestrators'
+                                  : avail === 'unavailable'
+                                    ? 'Model is not currently available on this provider'
+                                    : 'Provider models not yet verified'
+                            }
+                          >
+                            <span className={`status-dot ${dotClass}`} />
+                            {badgeLabel}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td>
+                      {entry.cost_tier} (#{entry.cost_rank})
+                    </td>
+                    <td>
+                      <div className="tags compact-tags">
+                        {entry.skills.map(s => (
+                          <span key={s}>{s}</span>
+                        ))}
+                      </div>
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        className="pill"
+                        disabled={toggleBusy === entry.container_id}
+                        onClick={() => void handleToggleActive(entry.container_id)}
+                        title={entry.active ? 'Click to deactivate' : 'Click to activate'}
+                      >
+                        <span className={`status-dot ${entry.active ? 'green' : 'muted'}`} />
+                        {toggleBusy === entry.container_id
+                          ? 'Saving…'
+                          : entry.active
+                            ? 'Active'
+                            : 'Inactive'}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         ) : (
@@ -591,30 +1217,57 @@ export default function ContainerRegistry({
       </div>
       <div className="agent-grid">
         {agents.length ? (
-          agents.map(agent => (
-            <article className="panel agent-card" key={agent.container_id}>
-              <div className="agent-card-top">
-                <div className="agent-icon">
-                  <Bot size={20} />
+          agents.map(agent => {
+            const serviceProvider = resolveServiceProvider(agent);
+            const avail = getModelAvailability(serviceProvider, agent.model);
+            const badgeClass = avail === 'tool_ready' ? 'ready' : avail;
+            const dotClass =
+              avail === 'ready' || avail === 'tool_ready'
+                ? 'green'
+                : avail === 'unavailable'
+                  ? 'yellow'
+                  : 'muted';
+            const badgeLabel =
+              avail === 'tool_ready'
+                ? 'Tool Ready'
+                : avail === 'ready'
+                  ? 'Model Ready'
+                  : avail === 'unavailable'
+                    ? 'Model Unavailable'
+                    : 'Unverified';
+            return (
+              <article className="panel agent-card" key={agent.container_id}>
+                <div className="agent-card-top">
+                  <div className="agent-icon">
+                    <Bot size={20} />
+                  </div>
+                  <div className="agent-card-badges">
+                    {agent.model && (
+                      <span className={`model-avail-badge ${badgeClass}`}>
+                        <span className={`status-dot ${dotClass}`} />
+                        {badgeLabel}
+                      </span>
+                    )}
+                    <span className="pill">
+                      <span className={`status-dot ${agent.active ? 'green' : 'muted'}`} />{' '}
+                      {agent.active ? 'Active' : 'Inactive'}
+                    </span>
+                  </div>
                 </div>
-                <span className="pill">
-                  <span className={`status-dot ${agent.active ? 'green' : 'muted'}`} />{' '}
-                  {agent.active ? 'Active' : 'Inactive'}
-                </span>
-              </div>
-              <h2>{agent.name}</h2>
-              <div className="agent-provider">
-                {agent.provider}
-                {agent.model ? ` · ${agent.model}` : ''}
-              </div>
-              <p>{agent.role}</p>
-              <div className="tags">
-                {agent.strengths?.map(strength => (
-                  <span key={strength}>{strength}</span>
-                ))}
-              </div>
-            </article>
-          ))
+                <h2>{agent.name}</h2>
+                <div className="agent-provider">
+                  {serviceProvider}
+                  {agent.model ? ` · ${agent.model}` : ''}
+                </div>
+                <p>{agent.role}</p>
+                <div className="tags">
+                  {agent.strengths?.map(strength => (
+                    <span key={strength}>{strength}</span>
+                  ))}
+                </div>
+              </article>
+            );
+          })
         ) : (
           <div className="panel agents-empty">
             <Bot size={24} />
@@ -624,42 +1277,110 @@ export default function ContainerRegistry({
         )}
       </div>
 
-      <div className="registry-heading">
+      <div className="registry-heading" ref={capabilitiesRef}>
         <div>
           <h2>Endpoint capabilities</h2>
-          <p>Discovered providers and models</p>
+          <p>
+            {capabilityStats.available} available for Agent Builder &amp; Orchestrators ·{' '}
+            {capabilityStats.unavailable} unavailable
+          </p>
+        </div>
+        <div className="rolodex-filters">
+          <div className="skills-filter-pills" role="group" aria-label="Filter models by availability">
+            {(
+              [
+                { id: 'all', label: `All (${capabilities.length})` },
+                { id: 'available', label: `Available (${capabilityStats.available})` },
+                { id: 'unavailable', label: `Unavailable (${capabilityStats.unavailable})` },
+              ] as const
+            ).map(pill => (
+              <button
+                key={pill.id}
+                type="button"
+                className={`skills-filter-pill ${capAvailFilter === pill.id ? 'active' : ''}`}
+                onClick={() => setCapAvailFilter(pill.id)}
+              >
+                {pill.label}
+              </button>
+            ))}
+          </div>
+          <select
+            value={capProviderFilter}
+            onChange={e => setCapProviderFilter(e.target.value)}
+            aria-label="Filter capabilities by provider"
+          >
+            <option value="all">All providers</option>
+            {capabilityStats.providers.map(p => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
         </div>
       </div>
       <div className="agent-grid">
-        {capabilities.length ? (
-          capabilities.map(cap => (
-            <article className="panel agent-card" key={`${cap.provider}:${cap.model_name}`}>
-              <div className="agent-card-top">
-                <div className="agent-icon">
-                  <Activity size={20} />
+        {filteredCapabilities.length ? (
+          filteredCapabilities.map(cap => {
+            const isAvailable = cap.available ?? cap.healthy;
+            const serviceProvider = cap.service_provider || cap.provider;
+            const checkedLabel = formatTimestamp(cap.last_checked);
+            return (
+              <article
+                className="panel agent-card"
+                key={`${serviceProvider}:${cap.provider}:${cap.model_name}`}
+              >
+                <div className="agent-card-top">
+                  <div className="agent-icon">
+                    <Activity size={20} />
+                  </div>
+                  <span className="pill">
+                    <span className={`status-dot ${isAvailable ? 'green' : 'red'}`} />{' '}
+                    {isAvailable
+                      ? cap.is_llm === false
+                        ? 'Tool Ready'
+                        : 'Builder / Orchestrator Ready'
+                      : 'Unavailable'}
+                  </span>
                 </div>
-                <span className="pill">
-                  <span className={`status-dot ${cap.healthy ? 'green' : 'red'}`} />{' '}
-                  {cap.healthy ? 'Healthy' : 'Unavailable'}
-                </span>
-              </div>
-              <h2>{cap.model_name}</h2>
-              <div className="agent-provider">
-                {cap.provider} · {cap.cost_tier} · {cap.max_context_tokens.toLocaleString()} tokens
-              </div>
-              <p>Recommended: {cap.recommended_roles?.join(', ') || 'None specified'}</p>
-              <div className="tags">
-                {cap.strengths?.map(strength => (
-                  <span key={strength}>{strength}</span>
-                ))}
-              </div>
-            </article>
-          ))
+                <h2>{cap.display_name || cap.model_name}</h2>
+                {cap.display_name && cap.display_name !== cap.model_name && (
+                  <div className="cap-model-id">
+                    <code>{cap.model_name}</code>
+                  </div>
+                )}
+                <div className="agent-provider">
+                  {serviceProvider} · {cap.cost_tier}
+                  {cap.max_context_tokens > 0 ? ` · ${cap.max_context_tokens.toLocaleString()} tokens` : ''}
+                </div>
+                <div className="cap-meta-row">
+                  {cap.discovery_source && (
+                    <span className={`discovery-badge ${cap.discovery_source}`}>
+                      {cap.discovery_source}
+                    </span>
+                  )}
+                  {cap.is_llm === false && <span className="discovery-badge tool">tool</span>}
+                  {checkedLabel && <span className="cap-checked-time">Checked {checkedLabel}</span>}
+                </div>
+                <p>Recommended: {cap.recommended_roles?.join(', ') || 'None specified'}</p>
+                <div className="tags">
+                  {cap.strengths?.map(strength => (
+                    <span key={strength}>{strength}</span>
+                  ))}
+                </div>
+              </article>
+            );
+          })
         ) : (
           <div className="panel agents-empty">
             <Activity size={24} />
-            <strong>No endpoints discovered</strong>
-            <span>Refresh the registry to discover capabilities.</span>
+            <strong>
+              {capabilities.length ? 'No models match the current filters' : 'No endpoints discovered'}
+            </strong>
+            <span>
+              {capabilities.length
+                ? 'Try resetting the provider or availability filter.'
+                : 'Register a provider or refresh the registry to discover capabilities.'}
+            </span>
           </div>
         )}
       </div>
@@ -786,66 +1507,86 @@ export default function ContainerRegistry({
         )}
       </div>
 
-      {apiKeyModal && (
+      {configModal && (
         <div
           className="modal-backdrop"
           onMouseDown={e => {
-            if (e.target === e.currentTarget && !keyBusy) setApiKeyModal(null);
+            if (e.target === e.currentTarget && !keyBusy) closeConfigModal();
           }}
         >
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="api-key-modal-title">
             <div className="modal-heading">
               <div>
-                <h2 id="api-key-modal-title">Configure {apiKeyModal.displayName}</h2>
-                <p>Saved locally to your 0o600 credentials vault.</p>
+                <h2 id="api-key-modal-title">Configure {configModal.displayName}</h2>
+                <p>
+                  {configModal.requiresApiKey
+                    ? 'Saved locally to your 0o600 credentials vault and probed for available models.'
+                    : 'Saved locally to your 0o600 credentials vault. Endpoint models will be discovered automatically.'}
+                </p>
               </div>
               <button
                 className="icon-button"
                 aria-label="Close"
-                onClick={() => setApiKeyModal(null)}
+                onClick={closeConfigModal}
                 disabled={keyBusy}
               >
                 <X size={17} />
               </button>
             </div>
-            <form onSubmit={e => void handleSaveKey(e)}>
-              <label htmlFor="provider-api-key">API Key</label>
-              <input
-                id="provider-api-key"
-                type="password"
-                value={apiKeyInput}
-                onChange={e => setApiKeyInput(e.target.value)}
-                placeholder="sk-..."
-                required
-                autoFocus
-              />
-              {apiKeyModal.provider === 'api' && (
+            <form onSubmit={e => void handleSaveConfig(e)}>
+              {(configModal.supportsApiKey || configModal.requiresApiKey) && (
                 <>
-                  <label htmlFor="provider-base-url">Base URL (optional)</label>
+                  <label htmlFor="provider-api-key">
+                    {configModal.requiresApiKey ? 'API Key' : 'API Key (optional)'}
+                  </label>
+                  <input
+                    id="provider-api-key"
+                    type="password"
+                    value={apiKeyInput}
+                    onChange={e => setApiKeyInput(e.target.value)}
+                    placeholder={configModal.requiresApiKey ? 'sk-...' : 'Optional bearer token'}
+                    required={configModal.requiresApiKey}
+                    autoFocus={configModal.requiresApiKey}
+                  />
+                </>
+              )}
+              {configModal.supportsBaseUrl && (
+                <>
+                  <label htmlFor="provider-base-url">
+                    {configModal.requiresApiKey
+                      ? 'Base URL (optional — leave blank to clear)'
+                      : 'Base URL (e.g. Ollama / LM Studio / vLLM)'}
+                  </label>
                   <input
                     id="provider-base-url"
                     type="url"
                     value={baseUrlInput}
                     onChange={e => setBaseUrlInput(e.target.value)}
-                    placeholder="https://api.openai.com/v1"
+                    placeholder={
+                      configModal.provider === 'local'
+                        ? 'http://127.0.0.1:11434/v1'
+                        : 'https://api.openai.com/v1'
+                    }
+                    autoFocus={!configModal.requiresApiKey}
                   />
                 </>
+              )}
+              {modalError && (
+                <div className="modal-error" role="alert">
+                  {modalError}
+                </div>
               )}
               <div className="modal-actions">
                 <button
                   type="button"
                   className="secondary-button"
-                  onClick={() => setApiKeyModal(null)}
+                  onClick={closeConfigModal}
                   disabled={keyBusy}
                 >
                   Cancel
                 </button>
-                <button
-                  type="submit"
-                  className="primary-button"
-                  disabled={keyBusy || !apiKeyInput.trim()}
-                >
-                  {keyBusy ? 'Saving…' : 'Save & Refresh'}
+                <button type="submit" className="primary-button" disabled={saveDisabled}>
+                  {keyBusy ? 'Saving & discovering…' : 'Save & Discover Models'}
                 </button>
               </div>
             </form>

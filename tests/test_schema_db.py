@@ -4,7 +4,14 @@ import pytest
 from pydantic import ValidationError
 
 from dagger.db import DatabaseManager
-from dagger.schema import AgentContainer, EndpointCapability, GraphEvent, KanbanTask
+from dagger.schema import (
+    AgentContainer,
+    AvailableModel,
+    EndpointCapability,
+    GraphEvent,
+    KanbanTask,
+    ProviderCredentialStatus,
+)
 
 
 def test_strict_validation():
@@ -62,3 +69,124 @@ async def test_seed_load_is_idempotent(db_path, tmp_path):
     async with DatabaseManager(db_path, seed_path=seed) as db:
         assert len(await db.list_containers()) == 1
         assert (await db.get_container("seeded")).name == "Changed"
+
+
+def test_available_model_and_provider_status_schema_defaults():
+    model = AvailableModel(
+        provider_id="gemini",
+        model_id="gemini-2.5-pro",
+        display_name="Gemini 2.5 Pro",
+        context_window=1_048_576,
+        discovery_source="live",
+        last_checked="2026-11-26T16:00:00Z",
+    )
+    assert model.available is True
+    assert model.is_llm is True
+    assert model.last_checked.tzinfo is not None
+
+    cap = EndpointCapability(provider="api", model_name="llama-3.3-70b-versatile")
+    assert cap.available is True
+    assert cap.service_provider is None
+    assert cap.display_name is None
+    assert cap.is_llm is True
+    assert cap.discovery_source == "static"
+
+    status = ProviderCredentialStatus(
+        provider_id="local",
+        display_name="Local OpenAI-Compatible",
+        kind="local",
+        status="unreachable",
+        supports_base_url=True,
+        requires_api_key=False,
+        base_url="http://127.0.0.1:11434/v1",
+        category="local",
+        available_models=[model],
+        available_model_count=1,
+        discovery_status="error",
+        discovery_error="connection refused",
+        last_discovered_at="2026-11-26T16:00:00Z",
+    )
+    assert status.status == "unreachable"
+    assert status.last_discovered_at is not None
+
+
+async def test_provider_models_atomic_replace_filtering_and_persistence(db_path):
+    async with DatabaseManager(db_path, seed_path=False) as db:
+        await db.replace_provider_models(
+            "groq",
+            [
+                AvailableModel(
+                    provider_id="groq",
+                    model_id="llama-3.3-70b-versatile",
+                    available=True,
+                    is_llm=True,
+                    discovery_source="live",
+                ),
+                AvailableModel(
+                    provider_id="groq",
+                    model_id="whisper-large-v3",
+                    available=True,
+                    is_llm=False,
+                    discovery_source="live",
+                ),
+                AvailableModel(
+                    provider_id="groq",
+                    model_id="deprecated-model",
+                    available=False,
+                    is_llm=True,
+                    discovery_source="live",
+                ),
+            ],
+        )
+        await db.replace_provider_models(
+            "tavily",
+            [
+                AvailableModel(
+                    provider_id="tavily",
+                    model_id="tavily-search",
+                    available=True,
+                    is_llm=False,
+                    discovery_source="static",
+                ),
+            ],
+        )
+
+        all_groq = await db.list_provider_models("groq")
+        assert [m.model_id for m in all_groq] == [
+            "deprecated-model",
+            "llama-3.3-70b-versatile",
+            "whisper-large-v3",
+        ]
+        avail_groq = await db.list_provider_models("groq", available_only=True)
+        assert [m.model_id for m in avail_groq] == ["llama-3.3-70b-versatile", "whisper-large-v3"]
+        llm_avail_groq = await db.list_provider_models("groq", available_only=True, llm_only=True)
+        assert [m.model_id for m in llm_avail_groq] == ["llama-3.3-70b-versatile"]
+
+        all_llm_avail = await db.list_provider_models(available_only=True, llm_only=True)
+        assert [(m.provider_id, m.model_id) for m in all_llm_avail] == [
+            ("groq", "llama-3.3-70b-versatile"),
+        ]
+
+        # Replacing groq models removes stale entries without affecting tavily.
+        await db.replace_provider_models(
+            "GROQ",
+            [
+                AvailableModel(
+                    provider_id="ignored",
+                    model_id="llama-3.1-8b-instant",
+                    available=True,
+                    is_llm=True,
+                    discovery_source="live",
+                )
+            ],
+        )
+        replaced = await db.list_provider_models("groq")
+        assert [(m.provider_id, m.model_id) for m in replaced] == [("groq", "llama-3.1-8b-instant")]
+        assert len(await db.list_provider_models("tavily")) == 1
+
+    # Verify persistence across reopen and WAL mode intact.
+    async with DatabaseManager(db_path, seed_path=False) as db:
+        assert [m.model_id for m in await db.list_provider_models("groq")] == ["llama-3.1-8b-instant"]
+        assert [m.model_id for m in await db.list_provider_models("tavily")] == ["tavily-search"]
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"

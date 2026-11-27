@@ -11,6 +11,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   copilot: '#8b5cf6',
   agy: '#ec4899',
   groq: '#f59e0b',
+  api: '#38bdf8',
   local: '#14b8a6',
   system: '#8291a3',
 };
@@ -23,8 +24,13 @@ function getProviderColor(provider?: string | null, nodeId?: string | null): str
     if (val.includes('gemini') || val.includes('google')) return PROVIDER_COLORS.gemini;
     if (val.includes('copilot') || val.includes('github')) return PROVIDER_COLORS.copilot;
     if (val.includes('agy') || val.includes('antigravity')) return PROVIDER_COLORS.agy;
-    if (val.includes('groq') || val === 'api' || val.startsWith('api_')) return PROVIDER_COLORS.groq;
+    if (val.includes('groq')) return PROVIDER_COLORS.groq;
     if (val.includes('local') || val.includes('ollama') || val.includes('lmstudio')) return PROVIDER_COLORS.local;
+  }
+  for (const val of candidates) {
+    if (val === 'api' || val.startsWith('api_') || val.includes('custom_api') || val.includes('openrouter')) {
+      return PROVIDER_COLORS.api;
+    }
   }
   return PROVIDER_COLORS.system;
 }

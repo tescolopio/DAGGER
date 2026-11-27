@@ -464,7 +464,7 @@ async def test_tiered_container_routing_selects_lightweight_for_audit_and_heavy_
     async with DatabaseManager(tmp_path / "board.sqlite", seed_path=seed_path) as db:
         fast = await db.get_container("fast_auditor_gemini")
         assert fast is not None
-        assert fast.model == "gemini-3.8-flash"
+        assert fast.model == "gemini-3.5-flash"
         assert fast.allowed_tools == ["read", "search"]
 
         orchestrator = Orchestrator(

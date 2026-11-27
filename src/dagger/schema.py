@@ -9,6 +9,19 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 ProviderType = Literal["claude", "codex", "gemini", "copilot", "agy", "api"]
 Provider = ProviderType
 CostTier = Literal["flat_subscription", "local_free", "metered_api"]
+DiscoverySource = Literal["live", "curated", "fallback", "static"]
+ProviderStatusValue = Literal[
+    "authenticated",
+    "configured",
+    "unauthenticated",
+    "expired",
+    "missing_binary",
+    "unreachable",
+    "error",
+    "api_key_configured",
+    "unconfigured",
+]
+DiscoveryStatusValue = Literal["ok", "fallback", "unverified", "error"]
 GraphEventType = Literal[
     "NODE_SPAWNED", "EDGE_TRAVERSED", "DOD_PASSED", "DOD_FAILED",
     "HUMAN_GATE", "COMPLETED", "FAILED", "FALLBACK", "SWARM_POST",
@@ -52,6 +65,22 @@ class AgentContainer(StrictModel):
 ContainerDefinition = AgentContainer
 
 
+class AvailableModel(StrictModel):
+    provider_id: str = Field(min_length=1)
+    model_id: str = Field(min_length=1)
+    display_name: str | None = None
+    available: bool = True
+    is_llm: bool = True
+    context_window: int = Field(default=0, ge=0)
+    discovery_source: DiscoverySource = "static"
+    last_checked: datetime = Field(default_factory=_now)
+
+    @field_validator("last_checked", mode="before")
+    @classmethod
+    def parse_last_checked(cls, value: Any) -> Any:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
+
+
 class EndpointCapability(StrictModel):
     provider: Provider
     model_name: str = Field(min_length=1)
@@ -61,6 +90,11 @@ class EndpointCapability(StrictModel):
     weaknesses: list[str] = Field(default_factory=list)
     recommended_roles: list[str] = Field(default_factory=list)
     healthy: bool = True
+    available: bool = True
+    service_provider: str | None = None
+    display_name: str | None = None
+    is_llm: bool = True
+    discovery_source: DiscoverySource = "static"
     version: str | None = None
     last_checked: datetime = Field(default_factory=_now)
 
@@ -175,10 +209,24 @@ class ProviderCredentialStatus(StrictModel):
     provider_id: str = Field(min_length=1)
     display_name: str = Field(min_length=1)
     kind: Literal["subscription_cli", "api_key", "local"]
-    status: Literal["authenticated", "expired", "missing_binary", "api_key_configured", "unconfigured"]
+    status: ProviderStatusValue
     detail: str = ""
     supports_login: bool = False
     supports_api_key: bool = False
+    supports_base_url: bool = False
+    requires_api_key: bool = False
+    base_url: str | None = None
+    category: Literal["llm", "tool", "local"] = "llm"
+    available_models: list[AvailableModel] = Field(default_factory=list)
+    available_model_count: int = Field(default=0, ge=0)
+    discovery_status: DiscoveryStatusValue = "unverified"
+    discovery_error: str | None = None
+    last_discovered_at: datetime | None = None
+
+    @field_validator("last_discovered_at", mode="before")
+    @classmethod
+    def parse_last_discovered_at(cls, value: Any) -> Any:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
 
 
 CardLogChannel = Literal["dialogue", "stdout", "stderr", "command", "system"]

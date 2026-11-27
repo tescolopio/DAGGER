@@ -3,7 +3,7 @@ name: Gemini Fast Auditor
 version: 1
 role: fast_auditor
 provider: gemini
-model: gemini-3.8-flash
+model: gemini-3.5-flash
 system_prompt: Rapidly audit repository changes, triage issues, and summarize findings.
 allowed_tools:
 - read
