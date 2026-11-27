@@ -18,6 +18,24 @@ The install is editable, so `dagger` always runs this checkout: pull or edit
 the code and the command picks it up (rebuild the UI after frontend changes).
 Remove it with `uv tool uninstall dagger-control-plane`.
 
+### Updating
+
+Update DAGGER in place from any directory (no PyPI release needed):
+
+```sh
+dagger --update                              # pull latest, refresh deps & rebuild UI if changed
+dagger update                                # equivalent subcommand
+dagger update --skip-pull --reinstall        # rebuild/reinstall local checkout without pulling
+dagger update --no-frontend                  # skip rebuilding frontend/dist
+```
+
+For editable git checkouts, `dagger update` checks for a clean branch, runs
+`git pull --ff-only`, refreshes the `uv` editable install when `pyproject.toml`
+or `uv.lock` changes, and rebuilds `frontend/` when UI files change (or
+`dist/` is missing). For non-editable `uv` tool installs, it runs
+`uv tool upgrade dagger-control-plane`. Restart any running `dagger` server
+afterwards to pick up the updated version.
+
 ## Usage
 
 Run `dagger` inside the repository you want agents to work on, the same way

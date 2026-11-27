@@ -106,3 +106,185 @@ def test_bare_dagger_launches_with_next_free_port(tmp_path: Path, monkeypatch):
         monkeypatch.setattr(cli, "_DEFAULT_PORT", taken)
         assert cli._pick_port("127.0.0.1", taken, explicit=False) != taken
     assert launched["root"] == project and launched["open_browser"] is True
+
+
+def _fake_checkout(tmp_path: Path, *, with_git: bool = True, with_node_modules: bool = True, with_dist: bool = True) -> Path:
+    root = tmp_path / "dagger-checkout"
+    root.mkdir(parents=True, exist_ok=True)
+    if with_git:
+        (root / ".git").mkdir()
+    frontend = root / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text('{"name": "dagger-frontend"}\n', encoding="utf-8")
+    if with_node_modules:
+        (frontend / "node_modules").mkdir()
+    if with_dist:
+        (frontend / "dist").mkdir()
+        (frontend / "dist" / "index.html").write_text("<html></html>\n", encoding="utf-8")
+    return root
+
+
+def _completed(cmd: list[str], returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
+
+
+def test_cli_update_flag_runs_from_arbitrary_cwd_without_project(tmp_path: Path, monkeypatch):
+    root = _fake_checkout(tmp_path)
+    external_dir = tmp_path / "cs-guru"
+    external_dir.mkdir()
+    monkeypatch.chdir(external_dir)
+    monkeypatch.setenv(paths.ENV_PROJECT, str(tmp_path / "nonexistent-project"))
+    monkeypatch.setattr(paths, "install_root", lambda: root)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    calls: list[tuple[list[str], str | None]] = []
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        calls.append((list(cmd), cwd))
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _completed(cmd, stdout="")
+        if "symbolic-ref" in cmd:
+            return _completed(cmd, stdout="main\n")
+        if "rev-parse" in cmd:
+            return _completed(cmd, stdout="abc1234\n")
+        if "pull" in cmd:
+            return _completed(cmd, stdout="Already up to date.\n")
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    result = CliRunner().invoke(cli.app, ["--update"])
+    assert result.exit_code == 0, result.output
+    assert "already up to date" in result.output.lower()
+    assert "Restart any running `dagger` server" in result.output
+    assert any("pull" in cmd for cmd, _ in calls)
+
+
+def test_cli_update_rejects_dirty_working_tree(tmp_path: Path, monkeypatch):
+    root = _fake_checkout(tmp_path)
+    monkeypatch.setattr(paths, "install_root", lambda: root)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _completed(cmd, stdout=" M src/dagger/cli.py\n")
+        raise AssertionError(f"Should not run further commands on dirty tree: {cmd}")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    result = CliRunner().invoke(cli.app, ["update"])
+    assert result.exit_code == 1
+    assert "uncommitted changes" in result.output
+    assert "--skip-pull" in result.output
+
+
+def test_cli_update_rejects_detached_head(tmp_path: Path, monkeypatch):
+    root = _fake_checkout(tmp_path)
+    monkeypatch.setattr(paths, "install_root", lambda: root)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _completed(cmd, stdout="")
+        if "symbolic-ref" in cmd:
+            return _completed(cmd, returncode=1, stdout="")
+        raise AssertionError(f"Should not run further commands on detached HEAD: {cmd}")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    result = CliRunner().invoke(cli.app, ["update"])
+    assert result.exit_code == 1
+    assert "detached HEAD" in result.output
+    assert "--skip-pull" in result.output
+
+
+def test_cli_update_pull_triggers_reinstall_npm_ci_and_frontend_build(tmp_path: Path, monkeypatch):
+    root = _fake_checkout(tmp_path)
+    monkeypatch.setattr(paths, "install_root", lambda: root)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    calls: list[tuple[list[str], str | None]] = []
+    rev_parse_count = 0
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        nonlocal rev_parse_count
+        calls.append((list(cmd), cwd))
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _completed(cmd, stdout="")
+        if "symbolic-ref" in cmd:
+            return _completed(cmd, stdout="main\n")
+        if "rev-parse" in cmd:
+            rev_parse_count += 1
+            return _completed(cmd, stdout="111aaaa\n" if rev_parse_count == 1 else "222bbbb\n")
+        if "pull" in cmd:
+            return _completed(cmd, stdout="Fast-forward\n")
+        if "diff" in cmd:
+            return _completed(
+                cmd,
+                stdout="pyproject.toml\nfrontend/package-lock.json\nfrontend/src/App.tsx\n",
+            )
+        return _completed(cmd, stdout="ok\n")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    result = CliRunner().invoke(cli.app, ["update"])
+    assert result.exit_code == 0, result.output
+    assert "111aaaa -> 222bbbb" in result.output
+    assert "Restart any running `dagger` server" in result.output
+
+    expected_uv = ["/usr/bin/uv", "tool", "install", "--editable", str(root), "--reinstall"]
+    assert (expected_uv, None) in calls
+    assert (["/usr/bin/npm", "ci"], str(root / "frontend")) in calls
+    assert (["/usr/bin/npm", "run", "build"], str(root / "frontend")) in calls
+
+
+def test_cli_update_flags_skip_pull_reinstall_no_frontend(tmp_path: Path, monkeypatch):
+    root = _fake_checkout(tmp_path, with_node_modules=False, with_dist=False)
+    monkeypatch.setattr(paths, "install_root", lambda: root)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None if name == "uv" else f"/usr/bin/{name}")
+
+    calls: list[tuple[list[str], str | None]] = []
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        calls.append((list(cmd), cwd))
+        return _completed(cmd, stdout="ok\n")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    # --skip-pull --reinstall --no-frontend: no git, pip fallback (uv absent), no npm
+    res = CliRunner().invoke(cli.app, ["update", "--skip-pull", "--reinstall", "--no-frontend"])
+    assert res.exit_code == 0, res.output
+    assert not any("git" in cmd[0] for cmd, _ in calls)
+    assert not any("npm" in cmd[0] for cmd, _ in calls)
+    assert any(cmd[1:] == ["-m", "pip", "install", "-e", str(root)] for cmd, _ in calls)
+
+    # --skip-pull alone (with missing node_modules/dist): triggers npm ci + npm run build, no git/reinstall
+    calls.clear()
+    res2 = CliRunner().invoke(cli.app, ["update", "--skip-pull"])
+    assert res2.exit_code == 0, res2.output
+    assert not any("git" in cmd[0] for cmd, _ in calls)
+    assert (["/usr/bin/npm", "ci"], str(root / "frontend")) in calls
+    assert (["/usr/bin/npm", "run", "build"], str(root / "frontend")) in calls
+
+
+def test_cli_update_non_git_install_uses_uv_tool_upgrade(tmp_path: Path, monkeypatch):
+    root = _fake_checkout(tmp_path, with_git=False)
+    monkeypatch.setattr(paths, "install_root", lambda: root)
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        calls.append(list(cmd))
+        return _completed(cmd, stdout="Upgraded dagger-control-plane\n")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    result = CliRunner().invoke(cli.app, ["update"])
+    assert result.exit_code == 0, result.output
+    assert calls == [["/usr/bin/uv", "tool", "upgrade", "dagger-control-plane"]]
+    assert "Restart any running `dagger` server" in result.output
+
+    # Without uv on PATH, fail cleanly with manual upgrade instructions
+    calls.clear()
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    result_no_uv = CliRunner().invoke(cli.app, ["update"])
+    assert result_no_uv.exit_code == 1
+    assert "uv tool upgrade dagger-control-plane" in result_no_uv.output
+    assert calls == []
